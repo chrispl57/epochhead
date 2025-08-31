@@ -6,6 +6,7 @@
 -- - Fallback Mining inference from loot items if title is missing
 -- - Loot attribution order: corpse GUID (mob) > gather > dead mouseover > recent kill > unknown
 -- - Quest logging (accept/complete/turn-in) WITHOUT QUEST_DETAIL
+--   * NOW logs objectives + reward preview (items/xp/gold) on ACCEPT
 -- - No per-event player blob (player only in meta)
 
 local ADDON_NAME, EHns = ...
@@ -67,7 +68,7 @@ local function StampMeta()
   local v, build, _date, iface = GetBuildInfo()
   meta.created       = meta.created or time()
   meta.addon         = "epochhead"
-  meta.version       = (EpochHead and EpochHead.VERSION) or "0.8.2"
+  meta.version       = (EpochHead and EpochHead.VERSION) or "0.8.3"
   meta.clientVersion = v
   meta.clientBuild   = tostring(build)
   meta.interface     = iface
@@ -884,7 +885,7 @@ local function OnLootOpened()
 end
 
 ------------------------------------------------------------
--- QUESTS (pickup: ID+text; turn-in: rewards/xp/money/receiver)
+-- QUESTS (pickup: ID+text+objectives+rewards; turn-in: rewards/xp/money/receiver)
 ------------------------------------------------------------
 local function QuestIDFromLink(link)
   -- e.g. |cffffff00|Hquest:12345:80|h[Title]|h|r
@@ -917,6 +918,60 @@ local function BuildNPCFromUnit(unit)
   return { id = id, guid = g, name = UnitName(unit) }
 end
 
+-- simple safe call helper
+local function safecall(fn, ...)
+  if type(fn) ~= "function" then return nil end
+  local ok, a, b, c, d = pcall(fn, ...)
+  if ok then return a, b, c, d end
+  return nil
+end
+
+-- Try to fetch quest-log reward items/xp/gold at accept time
+local function CaptureQuestLogRewards(questIndex)
+  local items, choices = {}, {}
+
+  local function qlItemLink(kind, i)
+    if type(GetQuestLogItemLink) ~= "function" then return nil end
+    local link = safecall(GetQuestLogItemLink, kind, i)
+    if link then return link end
+    if questIndex then
+      link = safecall(GetQuestLogItemLink, questIndex, kind, i)
+      if link then return link end
+    end
+    return nil
+  end
+
+  local nRewards = safecall(GetNumQuestLogRewards) or 0
+  local nChoices = safecall(GetNumQuestLogChoices) or 0
+
+  for i = 1, nRewards do
+    local name, tex, numItems, quality = (safecall(GetQuestLogRewardInfo, i))
+    if name then
+      local link = qlItemLink("reward", i)
+      local entry = BuildItemEntry(link, name, numItems, quality)
+      table.insert(items, entry)
+    end
+  end
+  for i = 1, nChoices do
+    local name, tex, numItems, quality = (safecall(GetQuestLogChoiceInfo, i))
+    if name then
+      local link = qlItemLink("choice", i)
+      local entry = BuildItemEntry(link, name, numItems, quality)
+      table.insert(choices, entry)
+    end
+  end
+
+  local xp    = safecall(GetQuestLogRewardXP)
+  local money = safecall(GetQuestLogRewardMoney)
+
+  return {
+    items = (#items > 0) and items or nil,
+    choiceItems = (#choices > 0) and choices or nil,
+    xp = xp,
+    money = (money and money > 0) and { copper = money } or nil,
+  }
+end
+
 -- Pending quest state (no detail subtype)
 EH._pendingQuestAccept = nil           -- { idx, ev, ts }
 EH._pendingQuestRewards = nil          -- { items = {...}, choiceItems = {...}, ts }
@@ -933,8 +988,10 @@ local function OnQuestAccepted(a1, a2)
     questIndex = a2
   end
 
-  local title, text
+  local title, description, objectives
   if questIndex and SelectQuestLogEntry then pcall(SelectQuestLogEntry, questIndex) end
+
+  -- Title
   if GetQuestLogTitle then
     local ok, t = pcall(function()
       local r = { GetQuestLogTitle(questIndex) }
@@ -942,20 +999,26 @@ local function OnQuestAccepted(a1, a2)
     end)
     if ok then title = t end
   end
+
+  -- Description + Objectives text
   if GetQuestLogQuestText then
-    local ok, d = pcall(function() return select(1, GetQuestLogQuestText()) end)
-    if ok then text = d end
+    local ok, d, o = pcall(GetQuestLogQuestText)
+    if ok then description = d; objectives = o end
   end
 
   local qid = questId or (questIndex and GetQuestIdFromLogIndex(questIndex)) or FindQuestIDByTitle(title)
+
+  -- Rewards preview at accept time
+  local preview = CaptureQuestLogRewards(questIndex)
 
   local x, y = GetPlayerXY()
   local ev = {
     type = "quest", subtype = "accept",
     t = now(), session = EH.session,
-    id = qid, title = title, text = text,
+    id = qid, title = title, text = description, objectives = objectives,
     giver = BuildNPCFromUnit("target"),
     zone = GetRealZoneText(), subzone = GetSubZoneText(), x = x, y = y,
+    rewardsPreview = preview, -- { items?, choiceItems?, xp?, money? }
   }
 
   if qid then
@@ -984,7 +1047,7 @@ local function OnQuestComplete()
   local items, choices = {}, {}
   local function captureList(kind, count)
     for i = 1, (count or 0) do
-      local link = GetQuestItemLink(kind, i)
+      local link = GetQuestItemLink and GetQuestItemLink(kind, i) or nil
       local name, tex, numItems, quality = GetQuestItemInfo(kind, i)
       local entry = BuildItemEntry(link, name, numItems, quality)
       if entry and entry.id then
