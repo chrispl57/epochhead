@@ -3,21 +3,22 @@
 # - First run: prompts for GAMEDIR\WTF\Account\ACCOUNTNAME\SavedVariables
 # - Watches <folder>\epochhead.lua, uploads on changes, renames after success
 # - Close hides window (keeps running); re-launch brings window to front; Quit exits
-# - Single instance (no deps), standard library only
+# - Single instance (Windows), no external deps
 
 import os, sys, json, time, threading, queue, re, socket
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 # ------------------ FIXED SETTINGS (not shown in UI) ------------------
-SERVER        = "http://193.233.161.214:5001"
-TOKEN         = "devtoken"
-VAR_NAME      = "epochheadDB"
-AUTO_RENAME   = True
-POLL_INTERVAL_SEC = 1.0
-DEBOUNCE_SEC      = 1.0
-UPLOAD_ENDPOINT   = "/upload"
-LOG_MAX_LINES     = 500
+SERVER             = "http://193.233.161.214:5001"
+TOKEN              = "devtoken"
+VAR_NAME           = "epochheadDB"
+AUTO_RENAME        = True
+POLL_INTERVAL_SEC  = 0.75      # watch loop period
+DEBOUNCE_SEC       = 0.75      # collapse rapid successive writes
+RETRY_ON_PARSE_SEC = 1.25      # if file was in-flight, retry soon
+UPLOAD_ENDPOINT    = "/upload"
+LOG_MAX_LINES      = 500
 
 # Single-instance + activation
 MUTEX_NAME   = r"Global\EpochUploaderMutex_v1"
@@ -28,7 +29,7 @@ APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "
 CONFIG_PATH = os.path.join(APPDATA_DIR, "config.json")
 
 # ---------------------------------------------------------------------
-# Single instance (Windows)
+# Single instance (Windows only)
 def _windows_mutex_singleton():
     try:
         import ctypes
@@ -129,7 +130,7 @@ def _find_var_table(src: str, varname: str) -> str:
             if i+1<n and src[i:i+2]==']]': in_block=False; i+=2; continue
             i+=1; continue
         if not in_str and ch=='-' and i+1<n and src[i+1]=='-':
-            if i+3<n and src[i+2]=='[' and src[i+3]==']':
+            if i+3<n and src[i+2]=='[' and src[i+3]=='[':
                 in_block=True; i+=4; continue
             else:
                 in_line=True; i+=2; continue
@@ -303,12 +304,13 @@ class App(tk.Tk):
         self.queue = queue.Queue()
         self._debounce_until = 0.0
         self._watcher_running = True
-        self._last_mtime = None
+
+        # NEW: robust signature (mtime_ns, size). None = unknown/not present.
+        self._last_sig = None  # type: tuple[int,int] | None
 
         cfg = load_config()
-        # Migrate old config key (sv_path) to folder if present
         sv_dir = cfg.get("sv_dir")
-        if not sv_dir and cfg.get("sv_path"):
+        if not sv_dir and cfg.get("sv_path"):  # migrate old config
             try:
                 sv_dir = os.path.dirname(cfg["sv_path"])
                 cfg["sv_dir"] = sv_dir
@@ -338,7 +340,6 @@ class App(tk.Tk):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
 
-        # Row: folder path + change button
         row = ttk.Frame(root); row.pack(fill="x")
         ttk.Label(row, text="SavedVariables folder:", font=("Segoe UI", 10, "bold")).pack(side="left")
         self.path_var = tk.StringVar(value=self.sv_dir or "")
@@ -427,6 +428,7 @@ class App(tk.Tk):
             cfg = load_config(); cfg["sv_dir"] = d; save_config(cfg)
             self._log(f"Selected folder: {d}")
             self._log("Target file: epochhead.lua")
+            self._last_sig = None  # reset so first detection uploads
         elif initial and not self.sv_dir:
             self._log("No folder selected. Use 'Change folder…' to pick the SavedVariables folder.")
 
@@ -434,23 +436,32 @@ class App(tk.Tk):
     def _manual_upload(self): self.queue.put("upload")
 
     def _watch_loop(self):
+        """Poll epochhead.lua and push an upload when signature changes
+           (first-seen, size change, or mtime change)."""
         while self._watcher_running:
             try:
                 p = self._sv_file_path()
-                if p and os.path.isfile(p):
-                    m = os.path.getmtime(p)
-                    if self._last_mtime is None:
-                        self._last_mtime = m
-                    elif m != self._last_mtime:
-                        self._last_mtime = m
-                        now = time.time()
-                        if now >= self._debounce_until:
-                            self._debounce_until = now + DEBOUNCE_SEC
-                            self.queue.put("upload")
-                # if file doesn't exist yet (e.g., after rename), we just wait
+                if p:
+                    try:
+                        st = os.stat(p)
+                        sig = (getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size)
+                        # Treat first-seen as a change as well:
+                        if self._last_sig is None or sig != self._last_sig:
+                            self._last_sig = sig
+                            now = time.time()
+                            if now >= self._debounce_until:
+                                self._debounce_until = now + DEBOUNCE_SEC
+                                self.queue.put("upload")
+                    except FileNotFoundError:
+                        # File not present (e.g., after rename) -> reset signature
+                        self._last_sig = None
             except Exception:
                 pass
             time.sleep(POLL_INTERVAL_SEC)
+
+    def _requeue_soon(self, secs=RETRY_ON_PARSE_SEC):
+        self._debounce_until = time.time() + secs
+        threading.Timer(secs, lambda: self.queue.put("upload")).start()
 
     def _do_upload(self):
         p = self._sv_file_path()
@@ -468,12 +479,18 @@ class App(tk.Tk):
             with open(p, "r", encoding="utf-8", errors="ignore") as f:
                 lua = f.read()
         except Exception as e:
-            self._set_status("Read error"); self._log(f"Read error: {e}"); return
+            self._set_status("Read error"); self._log(f"Read error: {e}")
+            self._requeue_soon()
+            return
 
         try:
             sv = parse_savedvars(lua, VAR_NAME)
         except Exception as e:
-            self._set_status("Parse error"); self._log(f"Parse error: {e}"); return
+            # Common if we grabbed while the game is mid-write; try again shortly.
+            self._set_status("Parse error; will retry")
+            self._log(f"Parse error (likely mid-write). Retrying soon… ({e})")
+            self._requeue_soon()
+            return
 
         events = list(sv.get("events") or [])
         meta   = dict(sv.get("meta")   or {})
@@ -505,7 +522,7 @@ class App(tk.Tk):
                 os.replace(p, new_path)
                 self._log(f"Renamed uploaded file -> {new_name}")
                 self._set_status("Uploaded & renamed")
-                self._last_mtime = None  # wait for addon to recreate epochhead.lua
+                self._last_sig = None  # force re-upload when epochhead.lua re-appears
             except Exception as e:
                 self._log(f"Rename failed: {e}")
                 self._set_status("Uploaded (rename failed)")
