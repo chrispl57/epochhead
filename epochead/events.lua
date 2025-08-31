@@ -351,6 +351,12 @@ local seenKillByGUID = {} -- guid -> ts
 local function killSeenRecently(g) local t = seenKillByGUID[g]; return t and ((now() - t) < KILL_DEDUPE) end
 local function markKill(g) if g then seenKillByGUID[g] = now() end end
 
+-- 5 minute anti-dupe for LOOT by corpse GUID
+local LOOT_CORPSE_DEDUPE = 300
+local seenLootByGUID = {} -- guid -> ts
+local function lootSeenRecently(g) local t = seenLootByGUID[g]; return t and ((now() - t) < LOOT_CORPSE_DEDUPE) end
+local function markLoot(g) if g then seenLootByGUID[g] = now() end end
+
 local function PushKillEventFromSource(src)
   if not src or not src.id then return end
   local ev = {
@@ -457,6 +463,12 @@ local function PushLootEvent(items, moneyCopper)
     PushKillEventFromSource(src)
   end
 
+  -- **NEW**: 5-minute dedupe for the same corpse GUID on loot
+  if g and lootSeenRecently(g) then
+    if EH._debug then log("loot skipped (corpse GUID cooldown) guid="..tostring(g)) end
+    return
+  end
+
   local ev = {
     type = "loot",
     t = now(),
@@ -467,6 +479,10 @@ local function PushLootEvent(items, moneyCopper)
     money = moneyCopper and { copper = moneyCopper } or nil,
     instance = GetInstanceInfoLite(),
   }
+
+  -- Mark corpse as looted only when we're about to log it
+  if g then markLoot(g) end
+
   PUSH(ev); if EH._debug then log("loot items="..tostring(#items).." srcKey="..tostring(sKey)) end
 end
 
