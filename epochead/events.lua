@@ -4,11 +4,8 @@
 -- - Fishing detection (spell + CLEU + fallback), fishing loot events
 -- - Mining/Herbalism node detection via loot window title (non-nil sourceKey)
 -- - Fallback Mining inference from loot items if title is missing
--- - Item tooltip "extras" parsing preserved for items.json
--- - Quest logging (reliably includes quest ID on 3.3.5a) — WITHOUT QUEST_DETAIL:
---     * QUEST_ACCEPTED  -> quest pickup (**with ID**, tolerant of arg shapes; retries via QUEST_LOG_UPDATE)
---     * QUEST_COMPLETE  -> capture reward lists (guaranteed & choices)
---     * QUEST_TURNED_IN -> quest turn-in (receiver + xp + money + rewards)
+-- - Loot attribution order: corpse GUID (mob) > gather > dead mouseover > recent kill > unknown
+-- - Quest logging (accept/complete/turn-in) WITHOUT QUEST_DETAIL
 -- - No per-event player blob (player only in meta)
 
 local ADDON_NAME, EHns = ...
@@ -103,6 +100,24 @@ end
 EH.session = EH.session or make_session()
 EH._debug  = EH._debug or false
 
+-- Provide safe fallbacks if core didn’t define these helpers
+if not EH.now then function EH.now() return now() end end
+local function GetPlayerXY()
+  if GetPlayerMapPosition then
+    local x, y = GetPlayerMapPosition("player")
+    if x and y then return x, y end
+  end
+  return 0, 0
+end
+local function ZoneAndSubzone() return GetRealZoneText(), GetSubZoneText() end
+if not EH.Pos then
+  function EH.Pos()
+    local z, s = ZoneAndSubzone()
+    local x, y = GetPlayerXY()
+    return z, s, x, y
+  end
+end
+
 ------------------------------------------------------------
 -- Mob snapshot cache (for robust level capture)
 ------------------------------------------------------------
@@ -112,21 +127,6 @@ local function UnitLevelSafe(unit)
   local lvl = UnitLevel and UnitLevel(unit) or nil
   if type(lvl) == "number" and lvl > 0 then return lvl end
   return nil
-end
-
-------------------------------------------------------------
--- Coords & zone helpers
-------------------------------------------------------------
-local function GetPlayerXY()
-  if GetPlayerMapPosition then
-    local x, y = GetPlayerMapPosition("player")
-    if x and y then return x, y end
-  end
-  return 0, 0
-end
-
-local function ZoneAndSubzone()
-  return GetRealZoneText(), GetSubZoneText()
 end
 
 ------------------------------------------------------------
@@ -457,13 +457,15 @@ end
 
 -- Push a loot event with correct attribution precedence:
 -- corpse GUID (mob) > gather > lastDeadMouseover > lastMob window > unknown
-local function PushLootEvent(items, moneyCopper, lootGUID)
+-- ctx = { isFishing=bool, isGather=bool }
+local function PushLootEvent(items, moneyCopper, lootGUID, ctx)
   local src, sKey, g = nil, nil, lootGUID
   local hasCorpse = (g ~= nil)
+  local isFish   = ctx and ctx.isFishing or false
+  local isGather = ctx and ctx.isGather  or false
 
   -- If this loot is from a corpse (GUID present), we attribute to a MOB.
   if hasCorpse then
-    -- Try to match the GUID to target/mouseover for richer metadata.
     local targetGUID  = (UnitExists("target")    and UnitGUID("target")) or nil
     local mouseGUID   = (UnitExists("mouseover") and UnitGUID("mouseover")) or nil
     local chosenUnit  = nil
@@ -474,7 +476,6 @@ local function PushLootEvent(items, moneyCopper, lootGUID)
     if chosenUnit then
       src, sKey = MobSourceFromUnit(chosenUnit)
     else
-      -- Fallback: still a mob corpse via GUID; build minimal src.
       local mid = GetMobIdFromGUID(g)
       local x, y = GetPlayerXY()
       src = {
@@ -490,7 +491,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID)
     local x, y = GetPlayerXY()
     src = {
       kind       = "gather",
-      gatherKind = EH._currentGather.gatherKind,  -- "Mining" / "Herbalism"
+      gatherKind = EH._currentGather.gatherKind,
       nodeName   = EH._currentGather.nodeName,
       zone       = EH._currentGather.zone,
       subzone    = EH._currentGather.subzone,
@@ -541,8 +542,25 @@ local function PushLootEvent(items, moneyCopper, lootGUID)
     g = lastMob.guid
   end
 
-  -- Kill credit only applies for corpse GUIDs.
-  if hasCorpse and src and src.kind == "mob" and g and not killSeenRecently(g) then
+  -- 🎯 Kill credit:
+  -- 1) Always when corpse GUID is present (mob corpse),
+  -- 2) OR, when NO corpse GUID but it's clearly not fishing/gather AND we have a mob src+guid.
+  local shouldCreditKill =
+      (hasCorpse and src and src.kind == "mob" and g)
+      or ((not hasCorpse) and (not isFish) and (not isGather) and src and src.kind == "mob" and g)
+
+  if EH._debug then
+    if shouldCreditKill then
+      log(("kill credit via %s (corpse=%s gather=%s fish=%s) guid=%s")
+        :format(hasCorpse and "corpse" or "loot-fallback",
+                tostring(hasCorpse), tostring(isGather), tostring(isFish), tostring(g)))
+    else
+      log(("no kill credit (corpse=%s gather=%s fish=%s src=%s)")
+        :format(tostring(hasCorpse), tostring(isGather), tostring(isFish), tostring(src and src.kind or "nil")))
+    end
+  end
+
+  if shouldCreditKill and not killSeenRecently(g) then
     markKill(g)
     PushKillEventFromSource(src)
   end
@@ -818,8 +836,6 @@ local function OnLootOpened()
       local cls = tostring(entry.info.class or ""):lower()
       local sub = tostring(entry.info.subclass or ""):lower()
       local nm  = tostring(entry.name or ""):lower()
-
-      -- Trade Goods / Metal & Stone is the main signal; names help too.
       if cls:find("trade") and (sub:find("metal") or sub:find("stone")) then return true end
       if nm:find(" ore") or nm:find(" bar") or nm:find(" stone") or nm:find(" dark iron") then return true end
       return false
@@ -856,7 +872,12 @@ local function OnLootOpened()
   local corpseGUID = DetectLootSourceGUID()
 
   if #items > 0 or moneyCopper > 0 then
-    PushLootEvent(items, (moneyCopper > 0) and moneyCopper or nil, corpseGUID)
+    PushLootEvent(
+      items,
+      (moneyCopper > 0) and moneyCopper or nil,
+      corpseGUID,
+      { isFishing = _isFishing, isGather = (EH._currentGather ~= nil) }
+    )
   elseif EH._debug then
     log("loot opened but no items/coins found")
   end
@@ -865,7 +886,6 @@ end
 ------------------------------------------------------------
 -- QUESTS (pickup: ID+text; turn-in: rewards/xp/money/receiver)
 ------------------------------------------------------------
--- Helpers
 local function QuestIDFromLink(link)
   -- e.g. |cffffff00|Hquest:12345:80|h[Title]|h|r
   local id = tostring(link or ""):match("Hquest:(%d+)")
@@ -894,11 +914,7 @@ local function BuildNPCFromUnit(unit)
   if not UnitExists or not UnitExists(unit) then return nil end
   local g = UnitGUID(unit)
   local id = g and GetMobIdFromGUID(g) or nil
-  return {
-    id   = id,
-    guid = g,
-    name = UnitName(unit),
-  }
+  return { id = id, guid = g, name = UnitName(unit) }
 end
 
 -- Pending quest state (no detail subtype)
@@ -907,8 +923,7 @@ EH._pendingQuestRewards = nil          -- { items = {...}, choiceItems = {...}, 
 
 -- Robust arg handling + id resolution
 local function OnQuestAccepted(a1, a2)
-  -- Handle common 3.3.5 shapes:
-  --  (questIndex), (player, questIndex), (questIndex, questId)
+  -- Common 3.3.5 shapes: (questIndex), (player, questIndex), (questIndex, questId)
   local questIndex, questId = nil, nil
   if type(a1) == "number" and type(a2) == "number" then
     questIndex, questId = a1, a2
@@ -918,9 +933,8 @@ local function OnQuestAccepted(a1, a2)
     questIndex = a2
   end
 
-  -- Title/text from log (safely)
-  if questIndex and SelectQuestLogEntry then pcall(SelectQuestLogEntry, questIndex) end
   local title, text
+  if questIndex and SelectQuestLogEntry then pcall(SelectQuestLogEntry, questIndex) end
   if GetQuestLogTitle then
     local ok, t = pcall(function()
       local r = { GetQuestLogTitle(questIndex) }
@@ -933,7 +947,6 @@ local function OnQuestAccepted(a1, a2)
     if ok then text = d end
   end
 
-  -- Resolve numeric questId if not provided
   local qid = questId or (questIndex and GetQuestIdFromLogIndex(questIndex)) or FindQuestIDByTitle(title)
 
   local x, y = GetPlayerXY()
@@ -949,7 +962,6 @@ local function OnQuestAccepted(a1, a2)
     PUSH(ev)
     EH._pendingQuestAccept = nil
   else
-    -- Defer until the quest log link is ready; retry on QUEST_LOG_UPDATE
     EH._pendingQuestAccept = { idx = questIndex, ev = ev, ts = now() }
   end
 end
@@ -963,7 +975,7 @@ local function OnQuestLogUpdate()
     PUSH(p.ev)
     EH._pendingQuestAccept = nil
   elseif (now() - (p.ts or 0)) > 12 then
-    -- Optional: push without ID after timeout (disabled by default)
+    -- Optional: push without ID after timeout (disabled)
   end
 end
 
@@ -1001,7 +1013,7 @@ local function OnQuestTurnedIn(questID, xpReward, moneyReward)
   local ev = {
     type = "quest", subtype = "turnin",
     t = now(), session = EH.session,
-    id = questID, title = nil, -- title not provided here; server will merge by id if seen before
+    id = questID, title = nil,
     receiver = receiver,
     zone = GetRealZoneText(), subzone = GetSubZoneText(), x = x, y = y,
     xp = xpReward,
@@ -1020,8 +1032,8 @@ local f = CreateFrame("Frame")
 f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 f:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
-f:RegisterEvent("PLAYER_TARGET_CHANGED")      -- keep mob snapshots fresh
-f:RegisterEvent("UNIT_LEVEL")                 -- refresh snapshot on level changes
+f:RegisterEvent("PLAYER_TARGET_CHANGED")
+f:RegisterEvent("UNIT_LEVEL")
 f:RegisterEvent("LOOT_OPENED")
 f:RegisterEvent("LOOT_CLOSED")
 f:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
@@ -1058,7 +1070,6 @@ f:SetScript("OnEvent", function(self, event, ...)
     OnLootOpened()
 
   elseif event == "LOOT_CLOSED" then
-    -- clear transient gather state
     EH._currentGather = nil
 
   elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
