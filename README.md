@@ -110,13 +110,6 @@ The uploader posts JSON to your server’s `/upload` endpoint (HTTP POST). Your 
 
 - More event types (trainers, vendors) parity and richer tooltips.
 - Optional metrics in the uploader (throughput, last response).
-- macOS/Linux uploader builds.
-
----
-
-## License
-
-Unless otherwise noted by files in subdirectories, this repository is provided “as-is” without warranty. Add your preferred license (MIT/Apache-2.0/etc.) here.
 
 ---
 
