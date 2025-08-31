@@ -2,6 +2,8 @@
 -- - Robust kill counting (CLEU + loot fallback), 5m anti-dupe
 -- - Rich mob source (level snapshot, classification, types, HP/Mana)
 -- - Fishing detection (spell + CLEU + fallback), fishing loot events
+-- - Mining/Herbalism node detection via loot window title (non-nil sourceKey)
+-- - Fallback Mining inference from loot items if title is missing
 -- - Item tooltip "extras" parsing preserved for items.json
 -- - Quest logging (reliably includes quest ID on 3.3.5a) — WITHOUT QUEST_DETAIL:
 --     * QUEST_ACCEPTED  -> quest pickup (**with ID**, tolerant of arg shapes; retries via QUEST_LOG_UPDATE)
@@ -113,7 +115,7 @@ local function UnitLevelSafe(unit)
 end
 
 ------------------------------------------------------------
--- Coords
+-- Coords & zone helpers
 ------------------------------------------------------------
 local function GetPlayerXY()
   if GetPlayerMapPosition then
@@ -121,6 +123,10 @@ local function GetPlayerXY()
     if x and y then return x, y end
   end
   return 0, 0
+end
+
+local function ZoneAndSubzone()
+  return GetRealZoneText(), GetSubZoneText()
 end
 
 ------------------------------------------------------------
@@ -357,6 +363,34 @@ local seenLootByGUID = {} -- guid -> ts
 local function lootSeenRecently(g) local t = seenLootByGUID[g]; return t and ((now() - t) < LOOT_CORPSE_DEDUPE) end
 local function markLoot(g) if g then seenLootByGUID[g] = now() end end
 
+-- Mining/Herbalism (gather) scratch
+EH._currentGather = nil  -- { gatherKind="Mining"/"Herbalism", nodeName, zone, subzone, x, y, sourceKey }
+
+-- Classifier for gather node based on loot title
+local function ClassifyGatherFromTitle(title)
+  if not title or title == "" then return nil end
+  local t = string.lower(title)
+  if t:find("vein") or t:find("deposit") or t:find("ore") or t:find("lode") then
+    return "Mining"
+  end
+  if t:find("herb") or t:find("bloom") or t:find("weed") or t:find("lotus")
+     or t:find("gromsblood") or t:find("mageroyal") or t:find("peacebloom")
+     or t:find("kingsblood") or t:find("dreamfoil") or t:find("goldthorn")
+  then
+    return "Herbalism"
+  end
+  return nil
+end
+
+-- Build gather sourceKey (colon-style similar to fishing)
+local function BuildGatherKey(kind, zone, subzone, nodeName)
+  local z = tostring(zone or "")
+  local s = (subzone and subzone ~= "" and (":"..subzone)) or ""
+  local n = tostring(nodeName or "Unknown Node")
+  -- e.g., gather:mining:Elwynn Forest:Northshire:Copper Vein
+  return string.format("gather:%s:%s%s:%s", string.lower(kind or "gather"), z, s, n)
+end
+
 local function PushKillEventFromSource(src)
   if not src or not src.id then return end
   local ev = {
@@ -368,6 +402,19 @@ local function PushKillEventFromSource(src)
     instance = GetInstanceInfoLite(),
   }
   PUSH(ev); if EH._debug then log("kill "..tostring(src.id)) end
+end
+
+-- Detect if the current loot window is tied to a corpse GUID.
+local function DetectLootSourceGUID()
+  if not GetLootSourceInfo then return nil end
+  local num = GetNumLootItems() or 0
+  for slot = 1, num do
+    local guid = select(1, GetLootSourceInfo(slot))
+    if guid then
+      return guid
+    end
+  end
+  return nil
 end
 
 -- Fishing loot emitter (namespaced, used by OnLootOpened)
@@ -408,15 +455,52 @@ if not EH.PushFishingLootEvent then
   end
 end
 
-local function PushLootEvent(items, moneyCopper)
-  local src, sKey, g = nil, nil, nil
+-- Push a loot event with correct attribution precedence:
+-- corpse GUID (mob) > gather > lastDeadMouseover > lastMob window > unknown
+local function PushLootEvent(items, moneyCopper, lootGUID)
+  local src, sKey, g = nil, nil, lootGUID
+  local hasCorpse = (g ~= nil)
 
-  -- Prefer current corpse target/mouseover
-  src, sKey, g = MobSourceFromUnit("target")
-  if not src then src, sKey, g = MobSourceFromUnit("mouseover") end
+  -- If this loot is from a corpse (GUID present), we attribute to a MOB.
+  if hasCorpse then
+    -- Try to match the GUID to target/mouseover for richer metadata.
+    local targetGUID  = (UnitExists("target")    and UnitGUID("target")) or nil
+    local mouseGUID   = (UnitExists("mouseover") and UnitGUID("mouseover")) or nil
+    local chosenUnit  = nil
+    if targetGUID  == g then chosenUnit = "target"
+    elseif mouseGUID == g then chosenUnit = "mouseover"
+    end
 
-  -- Recently observed dead mouseover
-  if not src and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 3) then
+    if chosenUnit then
+      src, sKey = MobSourceFromUnit(chosenUnit)
+    else
+      -- Fallback: still a mob corpse via GUID; build minimal src.
+      local mid = GetMobIdFromGUID(g)
+      local x, y = GetPlayerXY()
+      src = {
+        kind="mob", id=mid, guid=g, name=nil,
+        zone=GetRealZoneText(), subzone=GetSubZoneText(), x=x, y=y,
+      }
+      sKey = mid and tostring(mid) or nil
+    end
+  end
+
+  -- If no corpse GUID, prefer gather node (Mining/Herbalism) when detected.
+  if (not hasCorpse) and (not src) and EH._currentGather then
+    local x, y = GetPlayerXY()
+    src = {
+      kind       = "gather",
+      gatherKind = EH._currentGather.gatherKind,  -- "Mining" / "Herbalism"
+      nodeName   = EH._currentGather.nodeName,
+      zone       = EH._currentGather.zone,
+      subzone    = EH._currentGather.subzone,
+      x = x, y = y,
+    }
+    sKey = EH._currentGather.sourceKey
+  end
+
+  -- Recently observed dead mouseover (only if still unknown and no corpse GUID)
+  if (not hasCorpse) and (not src) and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 3) then
     local x, y = GetPlayerXY()
     src = {
       kind="mob", id=lastDeadMouseover.id, guid=lastDeadMouseover.guid,
@@ -434,8 +518,8 @@ local function PushLootEvent(items, moneyCopper)
     g = lastDeadMouseover.guid
   end
 
-  -- Recent kill fallback attribution
-  if not src and lastMob and (now() - lastMob.t) <= ATTRIB_WINDOW then
+  -- Recent kill fallback attribution (only if still unknown and no corpse GUID)
+  if (not hasCorpse) and (not src) and lastMob and (now() - lastMob.t) <= ATTRIB_WINDOW then
     local x, y = GetPlayerXY()
     src = {
       kind="mob",
@@ -457,31 +541,39 @@ local function PushLootEvent(items, moneyCopper)
     g = lastMob.guid
   end
 
-  -- Fallback kill credit via loot (once per GUID/5m)
-  if src and g and not killSeenRecently(g) then
+  -- Kill credit only applies for corpse GUIDs.
+  if hasCorpse and src and src.kind == "mob" and g and not killSeenRecently(g) then
     markKill(g)
     PushKillEventFromSource(src)
   end
 
-  -- **NEW**: 5-minute dedupe for the same corpse GUID on loot
-  if g and lootSeenRecently(g) then
+  -- 5-minute LOOT de-dupe only for corpse GUIDs.
+  if hasCorpse and lootSeenRecently(g) then
     if EH._debug then log("loot skipped (corpse GUID cooldown) guid="..tostring(g)) end
     return
+  end
+
+  -- Ensure a non-nil sourceKey (esp. for gather/unknown).
+  if (not sKey) and EH._currentGather then
+    sKey = EH._currentGather.sourceKey
+  end
+  if not sKey then
+    local z, s = ZoneAndSubzone()
+    sKey = "unknown:"..tostring(z or "")..((s and s ~= "") and (":"..s) or "")
   end
 
   local ev = {
     type = "loot",
     t = now(),
     session = EH.session,
-    source = src or {},         -- {} if unknown
-    sourceKey = sKey,           -- nil if unknown
+    source = src or {},
+    sourceKey = sKey,
     items = items,
     money = moneyCopper and { copper = moneyCopper } or nil,
     instance = GetInstanceInfoLite(),
   }
 
-  -- Mark corpse as looted only when we're about to log it
-  if g then markLoot(g) end
+  if hasCorpse then markLoot(g) end
 
   PUSH(ev); if EH._debug then log("loot items="..tostring(#items).." srcKey="..tostring(sKey)) end
 end
@@ -675,6 +767,28 @@ local function OnLootOpened()
     end
   end
 
+  -- Detect gather node from loot window title (before we build items)
+  EH._currentGather = nil
+  local nodeTitle = _G.LootFrameTitleText and _G.LootFrameTitleText.GetText and _G.LootFrameTitleText:GetText() or nil
+  if nodeTitle and nodeTitle ~= "" then
+    local kind = ClassifyGatherFromTitle(nodeTitle)
+    if kind then
+      local z, s = ZoneAndSubzone()
+      local x, y = GetPlayerXY()
+      EH._currentGather = {
+        gatherKind = kind,          -- "Mining" / "Herbalism"
+        nodeName   = nodeTitle,     -- e.g., "Copper Vein"
+        zone       = z,
+        subzone    = s,
+        x = x, y = y,
+        sourceKey  = BuildGatherKey(kind, z, s, nodeTitle),
+      }
+      if EH._debug then log(("gather detect: %s @ %s%s node='%s' -> %s")
+        :format(kind, tostring(z or ""), (s and s ~= "" and (":"..s) or ""), nodeTitle, EH._currentGather.sourceKey)) end
+    end
+  end
+
+  -- Build items/money from loot window
   local items = {}
   local moneyCopper = 0
   local num = GetNumLootItems() or 0
@@ -694,8 +808,55 @@ local function OnLootOpened()
     end
   end
 
+  -- Fallback: infer Mining from loot items if title didn't yield a gather node
+  if not EH._currentGather then
+    local oreLike, total = 0, 0
+    local firstOreName = nil
+
+    local function looksLikeMiningItem(entry)
+      if not entry or not entry.info then return false end
+      local cls = tostring(entry.info.class or ""):lower()
+      local sub = tostring(entry.info.subclass or ""):lower()
+      local nm  = tostring(entry.name or ""):lower()
+
+      -- Trade Goods / Metal & Stone is the main signal; names help too.
+      if cls:find("trade") and (sub:find("metal") or sub:find("stone")) then return true end
+      if nm:find(" ore") or nm:find(" bar") or nm:find(" stone") or nm:find(" dark iron") then return true end
+      return false
+    end
+
+    for _, it in ipairs(items) do
+      total = total + 1
+      if looksLikeMiningItem(it) then
+        oreLike = oreLike + 1
+        if not firstOreName then firstOreName = it.name end
+      end
+    end
+
+    if total > 0 and oreLike >= math.max(1, math.floor(total * 0.6)) then
+      local z, s = ZoneAndSubzone()
+      local x, y = GetPlayerXY()
+      local inferredNode = firstOreName and (firstOreName .. " Node") or "Mining Node"
+      EH._currentGather = {
+        gatherKind = "Mining",
+        nodeName   = inferredNode,
+        zone       = z,
+        subzone    = s,
+        x = x, y = y,
+        sourceKey  = BuildGatherKey("Mining", z, s, inferredNode),
+      }
+      if EH._debug then
+        log(("gather infer: Mining by loot composition (%d/%d ore-like) -> %s")
+          :format(oreLike, total, EH._currentGather.sourceKey))
+      end
+    end
+  end
+
+  -- Detect whether this loot window is tied to a corpse GUID.
+  local corpseGUID = DetectLootSourceGUID()
+
   if #items > 0 or moneyCopper > 0 then
-    PushLootEvent(items, moneyCopper > 0 and moneyCopper or nil)
+    PushLootEvent(items, (moneyCopper > 0) and moneyCopper or nil, corpseGUID)
   elseif EH._debug then
     log("loot opened but no items/coins found")
   end
@@ -758,8 +919,8 @@ local function OnQuestAccepted(a1, a2)
   end
 
   -- Title/text from log (safely)
-  local title, text
   if questIndex and SelectQuestLogEntry then pcall(SelectQuestLogEntry, questIndex) end
+  local title, text
   if GetQuestLogTitle then
     local ok, t = pcall(function()
       local r = { GetQuestLogTitle(questIndex) }
@@ -862,6 +1023,7 @@ f:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
 f:RegisterEvent("PLAYER_TARGET_CHANGED")      -- keep mob snapshots fresh
 f:RegisterEvent("UNIT_LEVEL")                 -- refresh snapshot on level changes
 f:RegisterEvent("LOOT_OPENED")
+f:RegisterEvent("LOOT_CLOSED")
 f:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 
 -- Quest events (no QUEST_DETAIL)
@@ -894,6 +1056,10 @@ f:SetScript("OnEvent", function(self, event, ...)
 
   elseif event == "LOOT_OPENED" then
     OnLootOpened()
+
+  elseif event == "LOOT_CLOSED" then
+    -- clear transient gather state
+    EH._currentGather = nil
 
   elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
     EH.OnSpellcastSucceeded(...)
