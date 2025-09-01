@@ -78,20 +78,6 @@ Community-powered data collection for Project Epoch (Classic WoW): a lightweight
 
 ---
 
-## Server expectations (summary)
-
-The uploader posts JSON to your server’s `/upload` endpoint (HTTP POST). Your server should:
-
-- Accept a body like:
-  ```json
-  { "token": "<your-token>", "payload": { "events": [...], "meta": {...} } }
-  ```
-- Write raw uploads to disk and/or materialize **derived** JSON (e.g., `derived/mob.json`, `derived/quest.json`, etc.) for your web UI to read.
-
-*(Server code is out of scope of this repo; configure your API base URL in your site accordingly.)*
-
----
-
 ## Troubleshooting
 
 - **Nothing uploads**  
