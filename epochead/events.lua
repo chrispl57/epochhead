@@ -1,9 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED, no QUEST_DETAIL)
+-- Version: 0.8.4
 -- - Robust kill counting (CLEU + loot fallback), 5m anti-dupe
 -- - Rich mob source (level snapshot, classification, types, HP/Mana)
 -- - Fishing detection (spell + CLEU + fallback), fishing loot events
 -- - Mining/Herbalism node detection via loot window title (non-nil sourceKey)
--- - Fallback Mining inference from loot items if title is missing
+-- - Fallback Mining inference from loot items if title is missing (ONLY when no corpse GUID)
 -- - Loot attribution order: corpse GUID (mob) > gather > dead mouseover > recent kill > unknown
 -- - Quest logging (accept/complete/turn-in) WITHOUT QUEST_DETAIL
 --   * NOW logs objectives + reward preview (items/xp/gold) on ACCEPT
@@ -12,6 +13,7 @@
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
+EH.VERSION = "0.8.4" -- bumped +0.0.1
 
 ----------------------------------------------------------------
 -- Safe fishing detector (namespaced) to avoid nil global calls
@@ -68,7 +70,7 @@ local function StampMeta()
   local v, build, _date, iface = GetBuildInfo()
   meta.created       = meta.created or time()
   meta.addon         = "epochhead"
-  meta.version       = (EpochHead and EpochHead.VERSION) or "0.8.3"
+  meta.version       = (EpochHead and EpochHead.VERSION) or "0.8.4"
   meta.clientVersion = v
   meta.clientBuild   = tostring(build)
   meta.interface     = iface
@@ -209,7 +211,7 @@ local function ParseExtrasFromTooltip(lines)
       extras.armorType = extras.armorType or l
     end
 
-    local a = l:match("(%d+)%s+[Aa]rmor")
+    local a = l:match("(%d+)%s+[Aa]rmor") or l:match("[Aa]rmor%s*:?%s*(%d+)") or l:match("[Aa]rmor%s*(%d+)")
     if a then extras.armor = extras.armor or num(a) end
     local sb = l:match("([%+%-]%d+)%s+[Bb]lock$")
     if sb then extras.shieldBlock = extras.shieldBlock or num(sb) end
@@ -483,7 +485,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, ctx)
         kind="mob", id=mid, guid=g, name=nil,
         zone=GetRealZoneText(), subzone=GetSubZoneText(), x=x, y=y,
       }
-      sKey = mid and tostring(mid) or nil
+      sKey = (mid and tostring(mid)) or nil
     end
   end
 
@@ -543,9 +545,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, ctx)
     g = lastMob.guid
   end
 
-  -- 🎯 Kill credit:
-  -- 1) Always when corpse GUID is present (mob corpse),
-  -- 2) OR, when NO corpse GUID but it's clearly not fishing/gather AND we have a mob src+guid.
+  -- 🎯 Kill credit rules
   local shouldCreditKill =
       (hasCorpse and src and src.kind == "mob" and g)
       or ((not hasCorpse) and (not isFish) and (not isGather) and src and src.kind == "mob" and g)
@@ -572,10 +572,17 @@ local function PushLootEvent(items, moneyCopper, lootGUID, ctx)
     return
   end
 
-  -- Ensure a non-nil sourceKey (esp. for gather/unknown).
+  -- 🔐 Ensure a non-nil sourceKey.
+  -- If corpse GUID exists but we couldn't parse a mob ID, fall back to GUID.
+  if hasCorpse and (not sKey) and g then
+    local mid = GetMobIdFromGUID(g)
+    sKey = tostring(mid or g)
+  end
+  -- If still nil and we have a detected gather, use it.
   if (not sKey) and EH._currentGather then
     sKey = EH._currentGather.sourceKey
   end
+  -- Final fallback: unknown:<Zone[:Subzone]>
   if not sKey then
     local z, s = ZoneAndSubzone()
     sKey = "unknown:"..tostring(z or "")..((s and s ~= "") and (":"..s) or "")
@@ -811,7 +818,6 @@ local function OnLootOpened()
   local items = {}
   local moneyCopper = 0
   local num = GetNumLootItems() or 0
-
   for slot = 1, num do
     local link = (GetLootSlotLink and GetLootSlotLink(slot)) or nil
     if link and tostring(link):find("item:") then
@@ -827,8 +833,12 @@ local function OnLootOpened()
     end
   end
 
-  -- Fallback: infer Mining from loot items if title didn't yield a gather node
-  if not EH._currentGather then
+  -- 🧭 Detect whether this loot window is tied to a corpse GUID (BEFORE fallback mining inference).
+  local corpseGUID = DetectLootSourceGUID()
+
+  -- Fallback: infer Mining from loot items ONLY if title didn't yield a gather node
+  --           AND there is NO corpse GUID (so we don't mislabel corpse loot with ore).
+  if (not EH._currentGather) and (corpseGUID == nil) then
     local oreLike, total = 0, 0
     local firstOreName = nil
 
@@ -869,15 +879,13 @@ local function OnLootOpened()
     end
   end
 
-  -- Detect whether this loot window is tied to a corpse GUID.
-  local corpseGUID = DetectLootSourceGUID()
-
   if #items > 0 or moneyCopper > 0 then
+    -- Notice: isGather is true only if we detected a gather AND there is no corpse GUID
     PushLootEvent(
       items,
       (moneyCopper > 0) and moneyCopper or nil,
       corpseGUID,
-      { isFishing = _isFishing, isGather = (EH._currentGather ~= nil) }
+      { isFishing = _isFishing, isGather = (EH._currentGather ~= nil and corpseGUID == nil) }
     )
   elseif EH._debug then
     log("loot opened but no items/coins found")
@@ -1112,7 +1120,7 @@ f:SetScript("OnEvent", function(self, event, ...)
     local addonName = ...
     if addonName and tostring(addonName):lower():find("epochhead") then
       StampMeta()
-      log("loaded (session="..tostring(EH.session)..")")
+      log("loaded v"..tostring(EH.VERSION).." (session="..tostring(EH.session)..")")
     end
 
   elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
