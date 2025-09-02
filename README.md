@@ -102,3 +102,5 @@ Community-powered data collection for Project Epoch (Classic WoW): a lightweight
 ## Credits
 
 Thanks to the Project Epoch community and contributors who gather and upload data.
+
+Issues with uploader/addon? Report an issue here or contact me on Discord: _ macetotheface _ (remove spaces)
