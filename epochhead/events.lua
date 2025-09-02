@@ -1,5 +1,5 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED, no QUEST_DETAIL)
--- Version: 0.8.8
+-- Version: 0.8.9 (container-in-bag logging)
 -- - Gather events simplified: no zone/subzone/coords; no "kills" on nodes
 -- - Gather sourceKey = "node:<GO id>" when available; else "node-name:<name>"
 -- - Each gather loot carries attempt=1 for clean drop-rate math
@@ -7,11 +7,12 @@
 -- - Word-bound mining terms (no "Darkshore"→Mining false positives)
 -- - Kill credit only for mobs (never nodes/containers)
 -- - Fishing logic retained (unchanged)
+-- - NEW: Inventory container (lockbox/clam/etc.) logging as kind="container" with sourceKey "container-item:<id>" or "container-name:<slug>"
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.8.8"
+EH.VERSION   = "0.8.9"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -231,7 +232,7 @@ local function ClassifyFromTitle(title)
      or hasWord(t, "barrel") or hasWord(t, "crate") or t:find("crates")
      or hasWord(t, "basket") or hasWord(t, "box") or hasWord(t, "trunk")
      or hasWord(t, "sack") or hasWord(t, "satchel") or hasWord(t, "strongbox")
-     or hasWord(t, "oyster") or hasWord(t, "shell") then
+     or hasWord(t, "oyster") or hasWord(t, "shell") or hasWord(t, "purse") then
     return "Container"
   end
   if hasWord(t, "vein") or hasWord(t, "deposit") or hasWord(t, "lode") or hasWord(t, "ore") then
@@ -385,14 +386,38 @@ local function BuildItemEntry(link, nameFromLoot, qtyFromLoot, qualityFromLoot)
 end
 
 ------------------------------------------------------------
--- Helpers: source keys for nodes
+-- Helpers: source keys for nodes/containers
 ------------------------------------------------------------
+local function slug(s) return tostring(s or "unknown"):lower():gsub("%s+", "_") end
+
 local function NodeSourceKey(nodeId, nodeName)
   if nodeId and tonumber(nodeId) then
     return "node:" .. tostring(nodeId)
   end
-  local n = tostring(nodeName or "Unknown Node"):lower():gsub("%s+", "_")
+  local n = slug(nodeName or "Unknown Node")
   return "node-name:" .. n
+end
+
+-- NEW: item-container keys (no zone/subzone tagging)
+local function ContainerSourceKey(itemId, itemName)
+  if itemId and tonumber(itemId) then
+    return "container-item:" .. tostring(itemId)
+  end
+  return "container-name:" .. slug(itemName or "Unknown Container")
+end
+
+-- NEW: detect container-ish item names/classes
+local function LooksLikeContainerItem(name, className, subClassName)
+  local t = tostring(name or ""):lower()
+  if t == "" then return false end
+  if t:find("lockbox") or hasWord(t,"strongbox") or hasWord(t,"footlocker") or hasWord(t,"clam")
+     or hasWord(t,"oyster") or hasWord(t,"shell") or hasWord(t,"satchel") or hasWord(t,"purse")
+     or hasWord(t,"bag") then
+    return true
+  end
+  local sc = tostring(subClassName or ""):lower()
+  if sc:find("lockbox") then return true end
+  return false
 end
 
 ------------------------------------------------------------
@@ -413,7 +438,8 @@ local seenLootByGUID = {}
 local function lootSeenRecently(g) local t = seenLootByGUID[g]; return t and ((now() - t) < LOOT_CORPSE_DEDUPE) end
 local function markLoot(g) if g then seenLootByGUID[g] = now() end end
 
-EH._currentGather = nil
+EH._currentGather    = nil
+EH._currentContainer = nil
 
 local function PushKillEventFromSource(src)
   if not src then return end
@@ -507,6 +533,40 @@ local function CoinFromName(name)
 end
 
 ------------------------------------------------------------
+-- NEW: hook UseContainerItem to remember last bag item used
+------------------------------------------------------------
+EH._pendingBagOpen = nil
+
+local function RememberBagUse(bag, slot)
+  if not GetContainerItemLink then return end
+  local link = GetContainerItemLink(bag, slot)
+  if not link then return end
+  local id = tonumber(tostring(link):match("item:(%d+)"))
+  local name, _, _, _, _, className, subClassName = GetItemInfo(link or "")
+  EH._pendingBagOpen = {
+    bag = bag, slot = slot, link = link, id = id, name = name,
+    class = className, subClass = subClassName, ts = now()
+  }
+end
+
+if type(hooksecurefunc) == "function" then
+  hooksecurefunc("UseContainerItem", function(bag, slot, onSelf, ...)
+    pcall(RememberBagUse, bag, slot)
+  end)
+else
+  -- super old clients fallback: hook the item button click (also secure)
+  if type(hooksecurefunc) == "function" and ContainerFrameItemButton_OnModifiedClick then
+    hooksecurefunc("ContainerFrameItemButton_OnModifiedClick", function(self, button)
+      if button == "RightButton" then
+        local bag = self:GetParent() and self:GetParent():GetID()
+        local slot = self:GetID()
+        if bag and slot then pcall(RememberBagUse, bag, slot) end
+      end
+    end)
+  end
+end
+
+------------------------------------------------------------
 -- Loot opened
 ------------------------------------------------------------
 local function IsProbablyMobName(name)
@@ -520,7 +580,18 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
   local src, sKey, g = nil, nil, lootGUID
   local hasSource = (g ~= nil)
 
-  if hasSource and lootKind == "Creature" then
+  -- NEW: inventory container path (has pending bag open and we marked it earlier)
+  if EH._currentContainer then
+    src = {
+      kind = "container",
+      containerKind = "item",
+      itemId = EH._currentContainer.itemId,
+      itemName = EH._currentContainer.itemName,
+    }
+    sKey = ContainerSourceKey(EH._currentContainer.itemId, EH._currentContainer.itemName)
+  end
+
+  if (not src) and hasSource and lootKind == "Creature" then
     local targetGUID  = (UnitExists("target")    and UnitGUID("target")) or nil
     local mouseGUID   = (UnitExists("mouseover") and UnitGUID("mouseover")) or nil
     local chosenUnit  = (targetGUID == g and "target") or (mouseGUID == g and "mouseover") or nil
@@ -532,7 +603,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
       sKey = (mid and tostring(mid)) or nil
     end
 
-  elseif hasSource and lootKind == "GameObject" then
+  elseif (not src) and hasSource and lootKind == "GameObject" then
     local nodeId = lootEntry or GetEntryIdFromGUID(g)
     local nodeName = EH._currentGather and EH._currentGather.nodeName or nil
     src = {
@@ -545,7 +616,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     sKey = NodeSourceKey(nodeId, nodeName)
   end
 
-  -- Fallback to title-detected gather if not bound to GUID
+  -- Fallback to title-detected gather if not bound to GUID (world node title)
   if (not src) and EH._currentGather then
     src = {
       kind="gather",
@@ -611,10 +682,9 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     instance = GetInstanceInfoLite(),
   }
 
-  -- Explicit attempt counter for gather nodes (for drop-rate denominators)
-  if src and src.kind == "gather" then
-    ev.attempt = 1
-  end
+  -- attempt counters
+  if src and src.kind == "gather" then ev.attempt = 1 end
+  if src and src.kind == "container" then ev.attempt = 1 end
 
   if hasSource and lootKind == "Creature" then markLoot(g) end
   PUSH(ev)
@@ -753,11 +823,24 @@ local function OnLootOpened()
   end
 
   -- Detect source + title (for gather)
-  EH._currentGather = nil
+  EH._currentGather    = nil
+  EH._currentContainer = nil
+
   local nodeTitle = _G.LootFrameTitleText and _G.LootFrameTitleText.GetText and _G.LootFrameTitleText:GetText() or nil
   local lootGUID, lootKind, lootEntry = DetectLootSource()
 
-  if nodeTitle and nodeTitle ~= "" then
+  -- NEW: if we just used a bag item and it looks like a container, flag as inventory container.
+  if EH._pendingBagOpen and (now() - (EH._pendingBagOpen.ts or 0) <= 8) then
+    local po = EH._pendingBagOpen
+    local looks = LooksLikeContainerItem(po.name, po.class, po.subClass)
+    -- If no GUID source (not a mob/go) OR title classifies container, treat as item-container
+    if looks and (not lootGUID or (nodeTitle and ClassifyFromTitle(nodeTitle) == "Container")) then
+      EH._currentContainer = { itemId = po.id, itemName = po.name }
+      log(("inventory container detected: %s (id=%s)"):format(tostring(po.name or "?"), tostring(po.id or "?")))
+    end
+  end
+
+  if (not EH._currentContainer) and nodeTitle and nodeTitle ~= "" then
     local kind = ClassifyFromTitle(nodeTitle) or "Container"
     local nodeId = (lootKind == "GameObject") and lootEntry or nil
     EH._currentGather = {
@@ -785,8 +868,8 @@ local function OnLootOpened()
     end
   end
 
-  -- Mining inference only if no loot GUID and no node title
-  if (not EH._currentGather) and (lootGUID == nil) then
+  -- Mining inference only if no loot GUID and no node title/container already set
+  if (not EH._currentContainer) and (not EH._currentGather) and (lootGUID == nil) then
     local oreLike, total, firstOreName = 0, 0, nil
     local function looksLikeMiningItem(entry)
       if not entry or not entry.info then return false end
@@ -971,6 +1054,8 @@ f:SetScript("OnEvent", function(self, event, ...)
       OnLootOpened()
     elseif event == "LOOT_CLOSED" then
       EH._currentGather = nil
+      EH._currentContainer = nil
+      EH._pendingBagOpen = nil
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
       EH.OnSpellcastSucceeded(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10)
     elseif event == "QUEST_ACCEPTED" then
