@@ -1,5 +1,5 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED, no QUEST_DETAIL)
--- Version: 0.8.9 (container-in-bag logging)
+-- Version: 0.9.0 (container-in-bag logging)
 -- - Gather events simplified: no zone/subzone/coords; no "kills" on nodes
 -- - Gather sourceKey = "node:<GO id>" when available; else "node-name:<name>"
 -- - Each gather loot carries attempt=1 for clean drop-rate math
@@ -12,7 +12,7 @@
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.8.9"
+EH.VERSION   = "0.9.0"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -438,6 +438,47 @@ local seenLootByGUID = {}
 local function lootSeenRecently(g) local t = seenLootByGUID[g]; return t and ((now() - t) < LOOT_CORPSE_DEDUPE) end
 local function markLoot(g) if g then seenLootByGUID[g] = now() end end
 
+-- Token-based loot de-dupe for non-mob cases (containers, nodes, inventory containers)
+local LOOT_TOKEN_TTL = 300
+local seenLootTokenAt = {}
+local function lootTokenSeenRecently(tok) local t = seenLootTokenAt[tok]; return t and ((now() - t) < LOOT_TOKEN_TTL) end
+local function markLootToken(tok) if tok then seenLootTokenAt[tok] = now() end end
+
+local function ItemsSignature(items, moneyCopper)
+  local parts = {}
+  if type(items) == "table" then
+    for _, it in ipairs(items) do
+      local id  = tonumber((it and it.id) or 0) or 0
+      local qty = tonumber((it and (it.qty or it.count)) or 1) or 1
+      parts[#parts+1] = (tostring(id) .. "x" .. tostring(qty))
+    end
+  end
+  table.sort(parts)
+  if moneyCopper and moneyCopper > 0 then parts[#parts+1] = ("c"..tostring(moneyCopper)) end
+  return table.concat(parts, "|")
+end
+
+local function BuildLootToken(src, sKey, g, lootKind, items, moneyCopper)
+  local sig = ItemsSignature(items, moneyCopper)
+  local typ = src and src.kind or lootKind or "unknown"
+  if typ == "container" and src and src.containerKind == "item" then
+    local idOrName = (src.itemId and tostring(src.itemId)) or (src.itemName and tostring(src.itemName)) or (sKey and tostring(sKey)) or "?"
+    return "icont:"..idOrName.."|"..sig
+  elseif lootKind == "GameObject" and g then
+    return "go:"..tostring(g).."|"..sig
+  elseif lootKind == "Creature" and g then
+    return "corpse:"..tostring(g).."|"..sig
+  elseif typ == "gather" then
+    local nid = (src and src.nodeId) and tostring(src.nodeId) or "?"
+    local nname = (src and src.nodeName) and tostring(src.nodeName) or ""
+    return "node:"..nid..":"..nname.."|"..sig
+  else
+    return "misc:"..tostring(sKey or lootKind or "?").."|"..sig
+  end
+end
+
+
+
 EH._currentGather    = nil
 EH._currentContainer = nil
 
@@ -659,6 +700,13 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
 
   -- Corpse GUID loot dedupe (mobs only)
   if hasSource and lootKind == "Creature" and lootSeenRecently(g) then
+
+  -- GameObject GUID loot dedupe (chests/nodes)
+  if hasSource and lootKind == "GameObject" and lootSeenRecently(g) then
+    log("loot skipped (gameobject GUID cooldown) guid="..tostring(g))
+    return
+  end
+
     log("loot skipped (corpse GUID cooldown) guid="..tostring(g))
     return
   end
@@ -670,6 +718,18 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
   if not sKey then
     sKey = "unknown"
   end
+
+  -- Token-based de-dupe for non-GUID cases (inventory containers, title-only nodes), or as an extra safety.
+  do
+    local _src = src
+    local _tok = BuildLootToken(_src, sKey, g, lootKind, items, moneyCopper)
+    if lootTokenSeenRecently(_tok) then
+      log("loot skipped (token cooldown) token="..tostring(_tok))
+      return
+    end
+  end
+
+
 
   local ev = {
     type = "loot",
@@ -687,6 +747,13 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
   if src and src.kind == "container" then ev.attempt = 1 end
 
   if hasSource and lootKind == "Creature" then markLoot(g) end
+  if hasSource and lootKind == "GameObject" then markLoot(g) end
+  do
+    local _src = src
+    local _tok = BuildLootToken(_src, sKey, g, lootKind, items, moneyCopper)
+    markLootToken(_tok)
+  end
+
   PUSH(ev)
   log("loot items="..tostring(#items).." srcKey="..tostring(sKey).." attempt="..tostring(ev.attempt or 0))
 end
