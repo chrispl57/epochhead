@@ -1,5 +1,5 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED, no QUEST_DETAIL)
--- Version: 0.9.0 (container-in-bag logging)
+-- Version: 0.9.01 (container-in-bag logging)
 -- - Gather events simplified: no zone/subzone/coords; no "kills" on nodes
 -- - Gather sourceKey = "node:<GO id>" when available; else "node-name:<name>"
 -- - Each gather loot carries attempt=1 for clean drop-rate math
@@ -12,7 +12,7 @@
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.0"
+EH.VERSION   = "0.9.01"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -477,7 +477,17 @@ local function BuildLootToken(src, sKey, g, lootKind, items, moneyCopper)
   end
 end
 
-
+-- NEW: allow disabling token dedupe for specific sources (e.g., mining)
+local function UseTokenDedupeFor(src, lootKind)
+  if src and src.kind == "gather" then
+    local gk = tostring(src.gatherKind or ""):lower()
+    if gk == "mining" then
+      -- Disable token dedupe for mining nodes to avoid skipping legit fast gathers
+      return false
+    end
+  end
+  return true
+end
 
 EH._currentGather    = nil
 EH._currentContainer = nil
@@ -698,16 +708,13 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     PushKillEventFromSource(src)
   end
 
-  -- Corpse GUID loot dedupe (mobs only)
+  -- GUID loot cooldown checks (fix: separate conditionals, not nested)
   if hasSource and lootKind == "Creature" and lootSeenRecently(g) then
-
-  -- GameObject GUID loot dedupe (chests/nodes)
-  if hasSource and lootKind == "GameObject" and lootSeenRecently(g) then
-    log("loot skipped (gameobject GUID cooldown) guid="..tostring(g))
+    log("loot skipped (corpse GUID cooldown) guid="..tostring(g))
     return
   end
-
-    log("loot skipped (corpse GUID cooldown) guid="..tostring(g))
+  if hasSource and lootKind == "GameObject" and lootSeenRecently(g) then
+    log("loot skipped (gameobject GUID cooldown) guid="..tostring(g))
     return
   end
 
@@ -722,14 +729,14 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
   -- Token-based de-dupe for non-GUID cases (inventory containers, title-only nodes), or as an extra safety.
   do
     local _src = src
-    local _tok = BuildLootToken(_src, sKey, g, lootKind, items, moneyCopper)
-    if lootTokenSeenRecently(_tok) then
-      log("loot skipped (token cooldown) token="..tostring(_tok))
-      return
+    if UseTokenDedupeFor(_src, lootKind) then
+      local _tok = BuildLootToken(_src, sKey, g, lootKind, items, moneyCopper)
+      if lootTokenSeenRecently(_tok) then
+        log("loot skipped (token cooldown) token="..tostring(_tok))
+        return
+      end
     end
   end
-
-
 
   local ev = {
     type = "loot",
@@ -750,8 +757,10 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
   if hasSource and lootKind == "GameObject" then markLoot(g) end
   do
     local _src = src
-    local _tok = BuildLootToken(_src, sKey, g, lootKind, items, moneyCopper)
-    markLootToken(_tok)
+    if UseTokenDedupeFor(_src, lootKind) then
+      local _tok = BuildLootToken(_src, sKey, g, lootKind, items, moneyCopper)
+      markLootToken(_tok)
+    end
   end
 
   PUSH(ev)
@@ -966,6 +975,13 @@ local function OnLootOpened()
   else
     log("loot opened but no items/coins found")
   end
+end
+
+------------------------------------------------------------
+-- Combat log + mouseover
+------------------------------------------------------------
+local function OnCombatLogEvent(self, event, ...)
+  -- re-used above; kept for completeness
 end
 
 ------------------------------------------------------------
