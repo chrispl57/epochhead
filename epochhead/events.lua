@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.23
+-- Version: 0.9.25
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.24"
+EH.VERSION   = "0.9.25"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -483,75 +483,51 @@ local function PushKillEventFromSource(src)
   log("kill " .. key)
 end
 
--- More robust corpse/node detection (works inside & outside parties)
-local function DetectLootSource()
-  if not GetLootSourceInfo then
-    log("DetectLootSource: API missing")
-    return nil, nil, nil
-  end
+-- Return both candidates so we can decide later
+local function DetectLootCandidates()
+  local goGuid, goEntry, crGuid, crEntry
 
-  local foundGuid, foundKind, foundEntry
-  local reason = "none"
-  local num = GetNumLootItems() or 0
-
-  -- Prefer Blizzard-provided loot sources
-  for slot = 1, num do
-    local t = { GetLootSourceInfo(slot) }
-    if #t >= 1 then
-      for i = 1, #t, 2 do
-        local guid = t[i]
-        if guid then
-          local kind  = GUIDKind(guid)
-          local entry = GetEntryIdFromGUID(guid)
-          if kind == "Creature" or kind == "GameObject" then
-            foundGuid, foundKind, foundEntry = guid, kind, entry
-            reason = "blizzard"
-            break
+  if GetLootSourceInfo then
+    local num = GetNumLootItems() or 0
+    for slot = 1, num do
+      local t = { GetLootSourceInfo(slot) }
+      if #t >= 1 then
+        for i = 1, #t, 2 do
+          local guid = t[i]
+          if guid then
+            local kind = GUIDKind(guid)
+            local entry = GetEntryIdFromGUID(guid)
+            if kind == "GameObject" and not goGuid then goGuid, goEntry = guid, entry end
+            if kind == "Creature"  and not crGuid then crGuid, crEntry = guid, entry end
           end
         end
       end
     end
-    if foundGuid then break end
   end
 
-  -- Fallback: current target (dead mob or node)
-  if not foundGuid and UnitExists("target") then
-    local g = UnitGUID("target")
-    if g then
-      local k = GUIDKind(g)
-      if k == "GameObject" or UnitIsDead("target") then
-        foundGuid, foundKind, foundEntry = g, k, GetEntryIdFromGUID(g); reason = "target"
-      end
+  -- Creature fallbacks only (GO has no sensible fallback)
+  if (not crGuid) then
+    if UnitExists and UnitExists("target") and UnitIsDead("target") then
+      local g = UnitGUID("target"); if g then crGuid, crEntry = g, GetEntryIdFromGUID(g) end
     end
   end
-
-  -- Fallback: mouseover (dead mob or node)
-  if not foundGuid and UnitExists("mouseover") then
-    local g = UnitGUID("mouseover")
-    if g then
-      local k = GUIDKind(g)
-      if k == "GameObject" or UnitIsDead("mouseover") then
-        foundGuid, foundKind, foundEntry = g, k, GetEntryIdFromGUID(g); reason = "mouseover"
-      end
+  if (not crGuid) then
+    if UnitExists and UnitExists("mouseover") and UnitIsDead("mouseover") then
+      local g = UnitGUID("mouseover"); if g then crGuid, crEntry = g, GetEntryIdFromGUID(g) end
     end
   end
-
-  -- Fallback: recently cached dead mouseover (our own cache)
-  if not foundGuid and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 12) then
-    foundGuid  = lastDeadMouseover.guid
-    foundKind  = "Creature"
-    foundEntry = lastDeadMouseover.id
-    reason     = "cached-dead-mouseover"
+  if (not crGuid) and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 10) then
+    crGuid, crEntry = lastDeadMouseover.guid, lastDeadMouseover.id
+  end
+  if (not crGuid) and lastMob and (now() - (lastMob.t or 0) <= 15) then
+    crGuid, crEntry = lastMob.guid, lastMob.id
   end
 
-  if foundGuid then
-    log(("DetectLootSource[%s]: guid=%s kind=%s entry=%s"):format(
-      reason, tostring(foundGuid), tostring(foundKind), tostring(foundEntry)))
-    return foundGuid, foundKind, foundEntry
-  else
-    log("DetectLootSource: no source resolved")
-    return nil, nil, nil
+  if EH._debug then
+    log(("candidates: GO guid=%s entry=%s | Creature guid=%s entry=%s")
+      :format(tostring(goGuid), tostring(goEntry), tostring(crGuid), tostring(crEntry)))
   end
+  return goGuid, goEntry, crGuid, crEntry
 end
 
 ------------------------------------------------------------
@@ -568,7 +544,7 @@ if not EH.IsFishingLootSafe then
 end
 
 -- Known gather spell ids (best-effort; name fallback used too)
-local FISHING_SPELL_IDS   = { [7732]=true, [7620]=true, [18248]=true }
+local FISHING_SPELL_IDS   = { [7732]=true, [7620]=true }
 local MINING_SPELL_IDS    = { [2575]=true }     -- "Mining"
 local HERBALISM_SPELL_IDS = { [2366]=true }     -- "Herb Gathering"
 
@@ -756,6 +732,7 @@ local function OnCombatLogEvent(self, event, ...)
         maxHp          = UnitHealthMax and UnitHealthMax("target") or nil,
         maxMana        = UnitManaMax and UnitManaMax("target") or nil,
       }
+      if EH._debug then log(("CLEU death: guid=%s id=%s name=%s"):format(tostring(dstGUID), tostring(mid), tostring(lastMob.name))) end
 
       if subevent == "PARTY_KILL" then
         if not killSeenRecently(dstGUID) then
@@ -778,15 +755,24 @@ local function OnCombatLogEvent(self, event, ...)
   end
 end
 
+-- Anti-spam mouseover dead snapshot
+EH._lastMouseoverDeadGUID = EH._lastMouseoverDeadGUID or nil
+EH._lastMouseoverDeadTS   = EH._lastMouseoverDeadTS   or 0
+local MOUSEOVER_DEAD_THROTTLE = 2.0
+
 local function OnUpdateMouseover()
   if UnitExists("mouseover") and UnitIsDead("mouseover") then
     local g = UnitGUID("mouseover")
     if g then
+      local nowt = now()
+      if g == EH._lastMouseoverDeadGUID and (nowt - EH._lastMouseoverDeadTS) < MOUSEOVER_DEAD_THROTTLE then
+        return
+      end
       local mid = GetEntryIdFromGUID(g)
       if mid then
         lastDeadMouseover = {
           id = mid, guid = g, name = UnitName("mouseover"),
-          t = now(),
+          t = nowt,
           level = (EH.mobSnap[g] and EH.mobSnap[g].level) or UnitLevelSafe("mouseover"),
           classification = UnitClassification and UnitClassification("mouseover") or nil,
           creatureType   = UnitCreatureType and UnitCreatureType("mouseover") or nil,
@@ -795,6 +781,9 @@ local function OnUpdateMouseover()
           maxHp          = UnitHealthMax and UnitHealthMax("mouseover") or nil,
           maxMana        = UnitManaMax and UnitManaMax("mouseover") or nil,
         }
+        EH._lastMouseoverDeadGUID = g
+        EH._lastMouseoverDeadTS   = nowt
+        if EH._debug then log(("mouseover dead snapshot: guid=%s id=%s name=%s"):format(tostring(g), tostring(mid), tostring(lastDeadMouseover.name))) end
       end
     end
   end
@@ -841,10 +830,22 @@ local function MiningNameFromItems(items)
   return nil
 end
 
+local function ItemsLookLikeMining(items)
+  return MiningNameFromItems(items) ~= nil
+end
+
 local function IsGenericMiningName(name)
   if not name or name == "" then return true end
   local low = name:lower()
   return (low == "mining node") or (low == "node") or (low == "deposit") or (low == "vein")
+end
+
+local function IsMinableCreatureGuid(guid)
+  local snap = guid and EH.mobSnap[guid]
+  local ct = snap and snap.creatureType
+  if not ct then return false end
+  local low = tostring(ct):lower()
+  return (low == "mechanical" or low == "elemental")
 end
 
 ------------------------------------------------------------
@@ -857,9 +858,13 @@ local function IsProbablyMobName(name)
   return false
 end
 
-local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
+-- opts = { gatherIntent=bool, corpseMining=bool, nodeTitle=string }
+local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, opts)
   local src, sKey, g = nil, nil, lootGUID
   local hasSource = (g ~= nil)
+  opts = opts or {}
+  local corpseMining = opts.corpseMining and (lootKind == "Creature")
+  local gatherIntent = opts.gatherIntent or false
 
   -- Inventory container (bag item opened)
   if EH._currentContainer then
@@ -872,20 +877,47 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     sKey = ContainerSourceKey(EH._currentContainer.itemId, EH._currentContainer.itemName)
   end
 
-  -- World GameObject (nodes/chests) — may also be corpse-mining
+  -- Corpse mining → treat as gather, keep corpseGuid only for debug/analytics
+  if (not src) and corpseMining and hasSource and lootKind == "Creature" then
+    local nodeName = (lastDeadMouseover and lastDeadMouseover.guid == g and lastDeadMouseover.name) or "Corpse (Mining)"
+    src = {
+      kind       = "gather",
+      gatherKind = "Mining",
+      nodeId     = nil,
+      nodeName   = nodeName,
+      guid       = nil,        -- never attach creature GUID as node GUID
+      corpseGuid = g,
+      corpseId   = lootEntry or GetEntryIdFromGUID(g),
+    }
+    sKey = "corpse-mining:" .. tostring(src.corpseId or g)
+    if EH._debug then
+      log(("loot (corpse-mining): corpseGuid=%s corpseId=%s nodeName=%s"):format(tostring(g), tostring(src.corpseId), tostring(nodeName)))
+    end
+  end
+
+  -- Normal mob corpse loot (Creature) — only if not corpse-mining AND not forced gather intent
+  if (not src) and hasSource and lootKind == "Creature" and (not corpseMining) and (not gatherIntent) then
+    local targetGUID  = (UnitExists("target") and UnitGUID("target")) or nil
+    local mouseGUID   = (UnitExists("mouseover") and UnitGUID("mouseover")) or nil
+    local chosenUnit  = (targetGUID == g and "target") or (mouseGUID == g and "mouseover") or nil
+    if chosenUnit then
+      src, sKey = MobSourceFromUnit(chosenUnit)
+    else
+      local mid = lootEntry or GetEntryIdFromGUID(g)
+      src = { kind="mob", id=mid, guid=g, name=nil }
+      sKey = (mid and tostring(mid)) or tostring(g)
+    end
+    if EH._debug then
+      log(("loot (corpse): guid=%s entry=%s sKey=%s"):format(tostring(g), tostring(lootEntry or GetEntryIdFromGUID(g)), tostring(sKey)))
+    end
+  end
+
+  -- World GameObject (nodes/chests)
   if (not src) and hasSource and lootKind == "GameObject" then
     local nodeId   = lootEntry or GetEntryIdFromGUID(g)
     local nodeName = (EH._currentGather and EH._currentGather.nodeName) or nil
     local gatherKind = (EH._currentGather and EH._currentGather.gatherKind) or ClassifyFromTitle(nodeName) or "Container"
 
-    -- Corpse-mining detection
-    if RecentGatherCast("Mining", 12) and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 8) then
-      gatherKind = "Mining"
-      nodeName   = lastDeadMouseover.name or ("Mob "..tostring(lastDeadMouseover.id or ""))
-      nodeId     = nil -- name-based key for corpse-mined "nodes"
-    end
-
-    -- If this is a Mining node and the name is missing/generic, derive from loot items (prefer Ore)
     if gatherKind == "Mining" and (not nodeName or IsGenericMiningName(nodeName)) then
       local derived = MiningNameFromItems(items)
       if derived then nodeName = derived end
@@ -897,53 +929,59 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
       gatherKind = gatherKind,
       nodeId = nodeId,
       nodeName = nodeName,
-      guid = g,
+      guid = g, -- GO guid is safe
     }
     sKey = NodeSourceKey(nodeId, nodeName)
+    if EH._debug then
+      log(("loot (node): goGuid=%s nodeId=%s nodeName=%s sKey=%s"):format(tostring(g), tostring(nodeId), tostring(nodeName), tostring(sKey)))
+    end
   end
 
-  -- Gather hint overrides mob even if a Creature GUID is present (e.g., nearby corpse)
-  if (not src) and (EH._currentGather or RecentGatherCast("Mining", 12) or RecentGatherCast("Herbalism", 12)) then
-    local gk = (EH._currentGather and EH._currentGather.gatherKind)
-               or (RecentGatherCast("Mining", 12) and "Mining")
-               or "Herbalism"
-    local nodeName = (EH._currentGather and EH._currentGather.nodeName) or nil
-
+  -- Fallback to gather hint if present (title-only or cast-only)
+  if (not src) and EH._currentGather then
+    local gk = EH._currentGather.gatherKind or "Container"
+    local nodeName = EH._currentGather.nodeName
     if gk == "Mining" and (not nodeName or IsGenericMiningName(nodeName)) then
       local derived = MiningNameFromItems(items)
       if derived then nodeName = derived end
       if not nodeName or nodeName == "" then nodeName = "Mining Node" end
     end
-
     src = {
       kind       = "gather",
       gatherKind = gk,
-      nodeId     = (EH._currentGather and EH._currentGather.nodeId) or nil,
-      nodeName   = nodeName or (gk == "Herbalism" and "Herb") or "Container",
-      guid       = (lootKind == "GameObject") and g or nil,  -- don't attach a Creature GUID to gather
+      nodeId     = EH._currentGather.nodeId,
+      nodeName   = nodeName,
+      guid       = nil, -- never attach creature guid here
     }
-    sKey = NodeSourceKey(src.nodeId, src.nodeName)
-    if EH._debug and hasSource and lootKind == "Creature" then
-      log("loot: gather hint override applied (Creature GUID ignored for source assignment)")
+    sKey = NodeSourceKey(EH._currentGather.nodeId, nodeName)
+    if EH._debug then
+      log(("loot (gather-hint): kind=%s name=%s sKey=%s"):format(tostring(gk), tostring(nodeName), tostring(sKey)))
     end
   end
 
-  -- Mob corpse loot (Creature) — runs only if gather/container didn't claim it
-  if (not src) and hasSource and lootKind == "Creature" then
-    local targetGUID  = (UnitExists("target") and UnitGUID("target")) or nil
-    local mouseGUID   = (UnitExists("mouseover") and UnitGUID("mouseover")) or nil
-    local chosenUnit  = (targetGUID == g and "target") or (mouseGUID == g and "mouseover") or nil
-    if chosenUnit then
-      src, sKey = MobSourceFromUnit(chosenUnit)
-    else
-      local mid = lootEntry or GetEntryIdFromGUID(g)
-      src = { kind="mob", id=mid, guid=g, name=nil }
-      sKey = (mid and tostring(mid)) or tostring(g)
+  -- NEW: Inferred gather when we have gather intent but no explicit GO/hint
+  if (not src) and gatherIntent then
+    local gk = (ItemsLookLikeMining(items) or RecentGatherCast("Mining", 12)) and "Mining"
+               or (RecentGatherCast("Herbalism", 12) and "Herbalism")
+               or "Container"
+    local nodeName = (gk == "Mining" and (MiningNameFromItems(items) or "Mining Node"))
+                     or (opts.nodeTitle and opts.nodeTitle ~= "" and opts.nodeTitle)
+                     or (gk .. " Node")
+    src = {
+      kind       = "gather",
+      gatherKind = gk,
+      nodeId     = nil,
+      nodeName   = nodeName,
+      guid       = nil,
+    }
+    sKey = NodeSourceKey(nil, nodeName)
+    if EH._debug then
+      log(("loot (gather-inferred): kind=%s name=%s sKey=%s"):format(tostring(gk), tostring(nodeName), tostring(sKey)))
     end
   end
 
-  -- Dead mouseover fallback (as mob)
-  if (not src) and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 3) then
+  -- Dead mouseover fallback (as mob) — only when NOT in gatherIntent mode
+  if (not src) and (not gatherIntent) and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 3) then
     src = {
       kind="mob", id=lastDeadMouseover.id, guid=lastDeadMouseover.guid, name=lastDeadMouseover.name,
       level=lastDeadMouseover.level, classification=lastDeadMouseover.classification,
@@ -952,12 +990,13 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     }
     sKey = tostring(lastDeadMouseover.id or lastDeadMouseover.guid)
     g = lastDeadMouseover.guid
-    lootKind = "Creature"
-    hasSource = (g ~= nil)
+    if EH._debug then
+      log(("loot (dead-mouseover fallback): guid=%s sKey=%s"):format(tostring(g), tostring(sKey)))
+    end
   end
 
-  -- Recent kill fallback (as mob)
-  if (not src) and lastMob and (now() - lastMob.t) <= 12 then
+  -- Recent kill fallback (as mob) — only when NOT in gatherIntent mode
+  if (not src) and (not gatherIntent) and lastMob and (now() - lastMob.t) <= 15 then
     src = {
       kind="mob", id=lastMob.id, guid=lastMob.guid, name=lastMob.name,
       level=lastMob.level, classification=lastMob.classification,
@@ -966,8 +1005,9 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     }
     sKey = tostring(lastMob.id or lastMob.guid)
     g = lastMob.guid
-    lootKind = "Creature"
-    hasSource = (g ~= nil)
+    if EH._debug then
+      log(("loot (recent-kill fallback): guid=%s sKey=%s"):format(tostring(g), tostring(sKey)))
+    end
   end
 
   -- Kill credit only for mobs
@@ -976,21 +1016,19 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     PushKillEventFromSource(src)
   end
 
-  -- GUID loot de-dupe (only when source kinds match)
-  if hasSource and lootKind == "Creature" and src and src.kind == "mob" and lootSeenRecently(g) then
+  -- GUID loot de-dupe (skip for corpse-mining so it doesn't throttle)
+  if (not corpseMining) and hasSource and lootKind == "Creature" and lootSeenRecently(g) then
     log("loot skipped (corpse GUID cooldown) guid="..tostring(g)); return
   end
-  if hasSource and lootKind == "GameObject" and src and src.kind == "gather" and lootSeenRecently(g) then
+  if hasSource and lootKind == "GameObject" and lootSeenRecently(g) then
     log("loot skipped (gameobject GUID cooldown) guid="..tostring(g)); return
   end
 
   -- Ensure sourceKey
   if not sKey then
-    if src and src.kind == "mob" then
-      local mid = (src and src.id) or (g and GetEntryIdFromGUID(g))
-      sKey = tostring(mid or g or "unknown")
-    elseif src and src.kind == "gather" then
-      sKey = NodeSourceKey(src.nodeId, src.nodeName)
+    if hasSource and lootKind == "Creature" then
+      local mid = lootEntry or GetEntryIdFromGUID(g)
+      sKey = tostring(mid or g)
     else
       sKey = "unknown"
     end
@@ -998,9 +1036,9 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
 
   -- Token de-dupe:
   --   * still active for mobs/nodes
-  --   * BYPASSED for gather and inventory-item containers (clams/lockboxes)
+  --   * BYPASSED for gather, inventory-item containers, and corpse-mining
   local _tok = BuildLootToken(src, sKey, g, lootKind, items, moneyCopper)
-  local bypassToken = (src and src.kind == "gather") or (src and src.kind == "container" and src.containerKind == "item")
+  local bypassToken = (src and src.kind == "gather") or (src and src.kind == "container" and src.containerKind == "item") or corpseMining
   if not bypassToken then
     if lootTokenSeenRecently(_tok) then
       log("loot skipped (token cooldown) token="..tostring(_tok))
@@ -1020,32 +1058,25 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
   }
 
   -- attempt counters
-  if src and src.kind == "gather"    then ev.attempt = 1 end
+  if src and src.kind == "gather" then ev.attempt = 1 end
   if src and src.kind == "container" then ev.attempt = 1 end
 
-  if hasSource and lootKind == "GameObject" and src and src.kind == "gather" then markLoot(g) end
-  if hasSource and lootKind == "Creature"  and src and src.kind == "mob"    then markLoot(g) end
+  -- Mark GUID cooldowns only for non-corpse-mining creature/node
+  if (not corpseMining) and hasSource and lootKind == "Creature" then markLoot(g) end
+  if hasSource and lootKind == "GameObject" then markLoot(g) end
 
   -- Only stamp token for non-bypassed kinds
   if not bypassToken then
     markLootToken(_tok)
   end
 
-  -- DEBUG: print the corpse GUID used for mob loot
-  if EH._debug and src and src.kind == "mob" then
-    local mid = src.id or (g and GetEntryIdFromGUID(g)) or nil
-    log(("loot (mob): guid=%s entry=%s key=%s items=%d money=%s token=%s")
-      :format(tostring(g or "?"), tostring(mid or "?"), tostring(sKey or "?"),
-              tonumber(#items or 0) or 0, tostring(moneyCopper or 0), tostring(_tok or "?")))
-  end
-  -- DEBUG: explicit note when gather overrode a Creature GUID
-  if EH._debug and src and src.kind == "gather" and hasSource and lootKind == "Creature" then
-    log(("loot (gather override): ignored creature guid=%s; node='%s' key=%s items=%d")
-      :format(tostring(g or "?"), tostring(src.nodeName or "?"), tostring(sKey or "?"), tonumber(#items or 0) or 0))
-  end
-
   PUSH(ev)
-  log("loot items="..tostring(#items).." srcKey="..tostring(sKey).." attempt="..tostring(ev.attempt or 0))
+
+  if EH._debug then
+    local corpseGuidDbg = (src and src.corpseGuid) and tostring(src.corpseGuid) or "nil"
+    log(("loot pushed: items=%d srcKey=%s kind=%s lootKind=%s corpseGuid=%s attempt=%s")
+      :format(#items, tostring(sKey), tostring(src and src.kind or "?"), tostring(lootKind or "?"), corpseGuidDbg, tostring(ev.attempt or 0)))
+  end
 end
 
 local function OnLootOpened()
@@ -1104,13 +1135,21 @@ local function OnLootOpened()
 
   -- title on loot frame (for chests/nodes)
   local nodeTitle = _G.LootFrameTitleText and _G.LootFrameTitleText.GetText and _G.LootFrameTitleText:GetText() or nil
-  local lootGUID, lootKind, lootEntry = DetectLootSource()
+  local titleKind = ClassifyFromTitle(nodeTitle)
+
+  -- early cast intent (items aren't read yet)
+  local miningCast = RecentGatherCast("Mining", 12)
+  local herbCast   = RecentGatherCast("Herbalism", 12)
+  local preGatherIntent = miningCast or herbCast or (titleKind ~= nil)
+
+  -- Find candidates first
+  local goGuid, goEntry, crGuid, crEntry = DetectLootCandidates()
 
   -- Inventory container (bag item) detection (works for lockboxes + clams)
   if EH._pendingBagOpen and (now() - (EH._pendingBagOpen.ts or 0) <= 8) then
     local po = EH._pendingBagOpen
     if LooksLikeContainerItem(po.name, po.class, po.subClass)
-       and (not lootGUID or (nodeTitle and ClassifyFromTitle(nodeTitle) == "Container")) then
+       and ( (not goGuid and not crGuid) or (nodeTitle and ClassifyFromTitle(nodeTitle) == "Container") ) then
       EH._currentContainer = { itemId = po.id, itemName = po.name }
       log(("inventory container: %s (id=%s)"):format(tostring(po.name or "?"), tostring(po.id or "?")))
     end
@@ -1118,9 +1157,9 @@ local function OnLootOpened()
 
   -- If we have a title and no explicit bag container, prefill gather hint
   if (not EH._currentContainer) and nodeTitle and nodeTitle ~= "" then
-    local nodeId = (lootKind == "GameObject") and lootEntry or nil
+    local nodeId = goGuid and goEntry or nil
     EH._currentGather = {
-      gatherKind = ClassifyFromTitle(nodeTitle) or "Container",
+      gatherKind = titleKind or "Container",
       nodeName   = nodeTitle,
       nodeId     = nodeId,
       sourceKey  = NodeSourceKey(nodeId, nodeTitle),
@@ -1144,30 +1183,62 @@ local function OnLootOpened()
     end
   end
 
-  -- If GUID was bad (e.g., Creature from a nearby corpse), still set a gather hint from cast
-  if (not EH._currentContainer) and (not EH._currentGather)
-     and (RecentGatherCast("Mining", 12) or RecentGatherCast("Herbalism", 12)) then
-    local kind = (RecentGatherCast("Mining", 12) and "Mining") or "Herbalism"
-    local inferredName = nodeTitle
-    if kind == "Mining" then
-      if (not inferredName) or IsGenericMiningName(inferredName) then
-        inferredName = MiningNameFromItems(items) or "Mining Node"
-      end
+  -- Final gather intent (now with items)
+  local itemsMiningLike = ItemsLookLikeMining(items)
+  local gatherIntent = preGatherIntent or itemsMiningLike
+
+  -- Strong corpse tie (for corpse-mining gating)
+  local corpseStrong = false
+  if crGuid then
+    local tg = (UnitExists("target") and UnitIsDead("target")) and UnitGUID("target") or nil
+    local mg = (UnitExists("mouseover") and UnitIsDead("mouseover")) and UnitGUID("mouseover") or nil
+    corpseStrong = (tg == crGuid) or (mg == crGuid)
+                   or (lastDeadMouseover and lastDeadMouseover.guid == crGuid and (now() - (lastDeadMouseover.t or 0) <= 8))
+                   or (lastMob and lastMob.guid == crGuid and (now() - (lastMob.t or 0) <= 6))
+  end
+
+  -- Decide source to pass forward:
+  local lootGUID, lootKind, lootEntry
+  if goGuid and gatherIntent then
+    -- Clear winner: a node present + gather intent
+    lootGUID, lootKind, lootEntry = goGuid, "GameObject", goEntry
+  elseif goGuid and not crGuid then
+    lootGUID, lootKind, lootEntry = goGuid, "GameObject", goEntry
+  elseif crGuid and not gatherIntent then
+    -- Pure creature case
+    lootGUID, lootKind, lootEntry = crGuid, "Creature", crEntry
+  elseif crGuid and gatherIntent then
+    -- Ambiguous: prefer NOT to bind to corpse unless strongly tied
+    if corpseStrong then
+      lootGUID, lootKind, lootEntry = crGuid, "Creature", crEntry
     else
-      inferredName = inferredName or "Herb"
+      lootGUID, lootKind, lootEntry = nil, nil, nil -- force gather inference
     end
-    EH._currentGather = {
-      gatherKind = kind,
-      nodeName   = inferredName,
-      nodeId     = (lootKind == "GameObject") and lootEntry or nil,
-      sourceKey  = NodeSourceKey((lootKind == "GameObject") and lootEntry or nil, inferredName),
-    }
-    log(("gather infer (by cast): %s -> node='%s' key=%s")
-      :format(kind, tostring(inferredName or "?"), tostring(EH._currentGather.sourceKey)))
+  else
+    -- Nothing reliable; if gather intent, force gather inference (no GUID)
+    lootGUID, lootKind, lootEntry = nil, nil, nil
+  end
+
+  if EH._debug then
+    log(("loot_opened: chosen guid=%s kind=%s entry=%s title=%s gatherIntent=%s itemsMiningLike=%s (go=%s / cr=%s corpseStrong=%s)")
+      :format(tostring(lootGUID), tostring(lootKind), tostring(lootEntry),
+              tostring(nodeTitle), tostring(gatherIntent), tostring(itemsMiningLike),
+              tostring(goGuid), tostring(crGuid), tostring(corpseStrong)))
+  end
+
+  -- Corpse-mining detection: require miningCast + itemsMiningLike + strong tie + minable creature
+  local corpseMining = false
+  if lootKind == "Creature" and miningCast and itemsMiningLike and corpseStrong and IsMinableCreatureGuid(lootGUID) then
+    corpseMining = true
   end
 
   -- Finally, push the loot
-  PushLootEvent(items, (moneyCopper > 0) and moneyCopper or nil, lootGUID, lootKind, lootEntry)
+  PushLootEvent(
+    items,
+    (moneyCopper > 0) and moneyCopper or nil,
+    lootGUID, lootKind, lootEntry,
+    { gatherIntent = gatherIntent, corpseMining = corpseMining, nodeTitle = nodeTitle }
+  )
 end
 
 ------------------------------------------------------------
