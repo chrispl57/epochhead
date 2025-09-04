@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.21
+-- Version: 0.9.22
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.21"
+EH.VERSION   = "0.9.22"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -483,23 +483,75 @@ local function PushKillEventFromSource(src)
   log("kill " .. key)
 end
 
+-- IMPROVED: robust corpse/node detection (works inside & outside parties)
 local function DetectLootSource()
-  if not GetLootSourceInfo then return nil, nil, nil end
+  if not GetLootSourceInfo then
+    log("DetectLootSource: API missing")
+    return nil, nil, nil
+  end
+
+  local foundGuid, foundKind, foundEntry
+  local reason = "none"
   local num = GetNumLootItems() or 0
+
+  -- 1) Prefer Blizzard-provided loot sources
   for slot = 1, num do
     local t = { GetLootSourceInfo(slot) }
     if #t >= 1 then
       for i = 1, #t, 2 do
         local guid = t[i]
         if guid then
-          local kind = GUIDKind(guid)
+          local kind  = GUIDKind(guid)
           local entry = GetEntryIdFromGUID(guid)
-          return guid, kind, entry
+          if kind == "Creature" or kind == "GameObject" then
+            foundGuid, foundKind, foundEntry = guid, kind, entry
+            reason = "blizzard"
+            break
+          end
         end
       end
     end
+    if foundGuid then break end
   end
-  return nil, nil, nil
+
+  -- 2) Fallback: current target (dead mob or node)
+  if not foundGuid and UnitExists("target") then
+    local g = UnitGUID("target")
+    if g then
+      local k = GUIDKind(g)
+      if k == "GameObject" or UnitIsDead("target") then
+        foundGuid, foundKind, foundEntry = g, k, GetEntryIdFromGUID(g); reason = "target"
+      end
+    end
+  end
+
+  -- 3) Fallback: mouseover (dead mob or node)
+  if not foundGuid and UnitExists("mouseover") then
+    local g = UnitGUID("mouseover")
+    if g then
+      local k = GUIDKind(g)
+      if k == "GameObject" or UnitIsDead("mouseover") then
+        foundGuid, foundKind, foundEntry = g, k, GetEntryIdFromGUID(g); reason = "mouseover"
+      end
+    end
+  end
+
+  -- 4) Fallback: recently cached dead mouseover (our own cache)
+  if not foundGuid and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 12) then
+    foundGuid  = lastDeadMouseover.guid
+    foundKind  = "Creature"
+    foundEntry = lastDeadMouseover.id
+    reason     = "cached-dead-mouseover"
+  end
+
+  if foundGuid then
+    log(("DetectLootSource[%s]: guid=%s kind=%s entry=%s"):format(
+      reason, tostring(foundGuid), tostring(foundKind), tostring(foundEntry)))
+    return foundGuid, foundKind, foundEntry
+  else
+    log("DetectLootSource: no source resolved")
+    return nil, nil, nil
+  end
 end
 
 ------------------------------------------------------------
@@ -892,7 +944,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     sKey = NodeSourceKey(EH._currentGather.nodeId, nodeName)
   end
 
-  -- Dead mouseover fallback (as mob)
+  -- Dead mouseover fallback (as mob) — ensure GUID/kind propagate for dedupe/token
   if (not src) and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 3) then
     src = {
       kind="mob", id=lastDeadMouseover.id, guid=lastDeadMouseover.guid, name=lastDeadMouseover.name,
@@ -902,9 +954,11 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     }
     sKey = tostring(lastDeadMouseover.id or lastDeadMouseover.guid)
     g = lastDeadMouseover.guid
+    lootKind = "Creature"
+    hasSource = (g ~= nil)
   end
 
-  -- Recent kill fallback (as mob)
+  -- Recent kill fallback (as mob) — ensure GUID/kind propagate for dedupe/token
   if (not src) and lastMob and (now() - lastMob.t) <= 12 then
     src = {
       kind="mob", id=lastMob.id, guid=lastMob.guid, name=lastMob.name,
@@ -914,6 +968,8 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
     }
     sKey = tostring(lastMob.id or lastMob.guid)
     g = lastMob.guid
+    lootKind = "Creature"
+    hasSource = (g ~= nil)
   end
 
   -- Kill credit only for mobs
@@ -973,6 +1029,14 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry)
   -- Only stamp token for non-bypassed kinds
   if not bypassToken then
     markLootToken(_tok)
+  end
+
+  -- DEBUG: print the corpse GUID used for mob loot
+  if EH._debug and src and src.kind == "mob" then
+    local mid = src.id or (g and GetEntryIdFromGUID(g)) or nil
+    log(("loot (mob): guid=%s entry=%s key=%s items=%d money=%s token=%s")
+      :format(tostring(g or "?"), tostring(mid or "?"), tostring(sKey or "?"),
+              tonumber(#items or 0) or 0, tostring(moneyCopper or 0), tostring(_tok or "?")))
   end
 
   PUSH(ev)
