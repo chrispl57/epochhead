@@ -4,7 +4,7 @@
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.23"
+EH.VERSION   = "0.9.24"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -568,7 +568,7 @@ if not EH.IsFishingLootSafe then
 end
 
 -- Known gather spell ids (best-effort; name fallback used too)
-local FISHING_SPELL_IDS   = { [7732]=true, [7620]=true }
+local FISHING_SPELL_IDS   = { [7732]=true, [7620]=true, [18248]=true }
 local MINING_SPELL_IDS    = { [2575]=true }     -- "Mining"
 local HERBALISM_SPELL_IDS = { [2366]=true }     -- "Herb Gathering"
 

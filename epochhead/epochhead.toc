@@ -2,7 +2,7 @@
 ## Title: epochhead
 ## Notes: Collects world data (kills, loot, nodes, quests, vendors, etc.) for a Wowhead-like site.
 ## Author: _macetotheface_ -- Discord Contact
-## Version: 0.9.23
+## Version: 0.9.24
 ## SavedVariables: epochheadDB
 
 init.lua
