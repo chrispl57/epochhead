@@ -1,5 +1,10 @@
 # EpochHead
 
+> **📥 WINDOWS USERS — NO PYTHON REQUIRED**  
+> **Download the ready-made uploader here:**  
+> 👉 **[epoch_uploader.exe (Latest Releases)](../../releases/latest/download/epoch_uploader.exe)**  
+> *(If that direct link doesn’t work in your viewer, open the Releases page: [See all releases →](../../releases))*
+
 Community-powered data collection for Project Epoch (Classic WoW): a lightweight in-game addon plus a desktop uploader that ships collected data to your backend for indexing and search.
 
 > **What’s here?**
@@ -9,7 +14,22 @@ Community-powered data collection for Project Epoch (Classic WoW): a lightweight
 
 ---
 
-## Repository layout
+## 🚀 Quick Start (Windows – recommended)
+
+1. **Download:** 👉 **[epoch_uploader.exe](../../releases/latest/download/epoch_uploader.exe)**  
+   *(Or open [Releases](../../releases) and grab `epoch_uploader.exe` from the latest tag.)*
+2. **Run it.** On first launch, **select your SavedVariables folder** (the folder, not the file), e.g.:  
+   ```
+   <WoW 3.3.5a>\WTF\Account\<ACCOUNTNAME>\SavedVariables
+   ```
+3. Play normally. Whenever `epochhead.lua` updates, the uploader **auto-uploads** it and then **archives** it as:  
+   `epochhead_uploadYYYYmmdd-HHMMSS.lua`
+
+> 🧰 SmartScreen note: Windows may warn about unrecognized apps. Click **More info → Run anyway**, or build from source (below).
+
+---
+
+## Repository Layout
 
 ```
 /EpochHead/       # The WoW addon (place into Interface/AddOns on 3.3.5a clients)
@@ -18,21 +38,21 @@ Community-powered data collection for Project Epoch (Classic WoW): a lightweight
 
 ---
 
-## How it works (end-to-end)
+## How It Works (end-to-end)
 
 1. **Install the addon** and play normally.
 2. The addon writes events to:  
    `GAMEDIR\WTF\Account\ACCOUNTNAME\SavedVariables\epochhead.lua`
 3. **Run the uploader app**:
-   - On first launch it asks you to select the **SavedVariables folder** (not the file).  
+   - On first launch it asks for the **SavedVariables folder** (not the file).  
      Example: `GAMEDIR\WTF\Account\ACCOUNTNAME\SavedVariables`
    - It **watches** for changes to `epochhead.lua` and **auto-uploads**.
-   - On **successful upload**, it **renames** the file to `epochhead_uploadYYYYmmdd-HHMMSS.lua` to prevent re-uploading the same data.
+   - On **success**, it **renames** the file to `epochhead_uploadYYYYmmdd-HHMMSS.lua` to prevent re-uploads.
    - Closing the window keeps it running in the background (single-instance behavior).
 
 ---
 
-## Addon installation
+## Addon Installation
 
 1. Copy the addon folder to your WoW client:
    ```
@@ -44,23 +64,13 @@ Community-powered data collection for Project Epoch (Classic WoW): a lightweight
    - `/eh debug on` — verbose logging in chat
    - `/eh debug off` — stop verbose logging
 
-> The addon writes to `SavedVariables\epochhead.lua` under your account folder, which the uploader monitors.
+> The addon writes to `SavedVariables\epochhead.lua`, which the uploader monitors.
 
 ---
 
-## Uploader (Windows)
+## 🐍 Prefer to Build the Uploader Yourself?
 
-### Quick start
-
-1. Download `epoch_uploader.exe` from Releases (or build it yourself; see below).
-2. Double-click to run. On first launch, select your **SavedVariables folder**:
-   ```
-   GAMEDIR\WTF\Account\ACCOUNTNAME\SavedVariables
-   ```
-3. Leave it running; it will upload automatically whenever `epochhead.lua` changes.  
-   After a successful upload, the file is archived as `epochhead_uploadYYYYmmdd-HHMMSS.lua`.
-
-### Build the uploader from source
+> You don’t need Python if you use the EXE above. This section is only for folks who want to build locally.
 
 1. Install **Python 3.9+** and pip.
 2. Install **PyInstaller**:
@@ -72,23 +82,21 @@ Community-powered data collection for Project Epoch (Classic WoW): a lightweight
    ```bash
    python -m PyInstaller --onefile --name epoch_uploader --noconsole epoch_uploader.py
    ```
-4. The binary will be in `dist/epoch_uploader.exe`.
-
-> Tip: If Windows SmartScreen warns you, click “More info → Run anyway.”
+4. The binary will be in: `dist/epoch_uploader.exe`
 
 ---
 
 ## Troubleshooting
 
-- **Nothing uploads**  
-  - Make sure you selected the **folder** `…\SavedVariables`, not the Lua file itself.  
-  - Confirm the game has actually written a fresh `epochhead.lua` (log out or reload UI).
-- **Uploader says “file not found”**  
+- **Nothing uploads**
+  - Make sure you selected the **folder** `…\SavedVariables`, not the Lua file itself.
+  - Confirm the game actually wrote a fresh `epochhead.lua` (log out or `/reload`).
+- **Uploader says “file not found”**
   - Verify you’re pointing at the correct WoW account folder (private servers often use custom account names).
-- **Duplicates**  
-  - Files are renamed on success. If you see re-uploads, check that the server returns HTTP 200 and allows overwriting/merging appropriately.
-- **Windows blocks the EXE**  
-  - Use “More info → Run anyway”, or build locally with PyInstaller (see above).
+- **Duplicates**
+  - Files are renamed on success. If you see re-uploads, check the server returns HTTP 200 and merges correctly.
+- **Windows blocks the EXE**
+  - Use “More info → Run anyway”, or build locally with PyInstaller.
 
 ---
 
@@ -103,4 +111,4 @@ Community-powered data collection for Project Epoch (Classic WoW): a lightweight
 
 Thanks to the Project Epoch community and contributors who gather and upload data.
 
-Issues with uploader/addon? Report an issue here or contact me on Discord: _ macetotheface _ (remove spaces)
+Issues with uploader/addon? Open an issue or contact on Discord: **_macetotheface_**.
