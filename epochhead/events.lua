@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.22
+-- Version: 0.9.27
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.22"
+EH.VERSION   = "0.9.27"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -19,7 +19,6 @@ local function oops(where, err)
   EH._lastError = (where or "?") .. ": " .. tostring(err)
   chat("|cffff6666ERROR|r " .. EH._lastError)
 end
-
 ------------------------------------------------------------
 -- SavedVariables root (event queue only; you aggregate offline)
 ------------------------------------------------------------
@@ -196,6 +195,10 @@ local function MobSourceFromUnit(unit)
   local g = UnitGUID(unit); if not g then return nil end
   local mid = GetEntryIdFromGUID(g)
   local lvl = UnitLevelSafe(unit) or (EH.mobSnap[g] and EH.mobSnap[g].level) or nil
+
+  -- NEW: capture location
+  local z, s, x, y = EH.Pos()
+
   local src = {
     kind = "mob",
     id   = mid,
@@ -208,9 +211,12 @@ local function MobSourceFromUnit(unit)
     reaction       = UnitReaction and UnitReaction("player", unit) or nil,
     maxHp          = UnitHealthMax and UnitHealthMax(unit) or nil,
     maxMana        = UnitManaMax and UnitManaMax(unit) or nil,
+    -- NEW
+    zone = z, subzone = s, x = x, y = y,
   }
   return src, (mid and tostring(mid) or nil), g
 end
+
 
 ------------------------------------------------------------
 -- Classifier (title → kind; container wins; word-bounded)
@@ -476,6 +482,16 @@ end
 ------------------------------------------------------------
 local function PushKillEventFromSource(src)
   if not src then return end
+
+  -- NEW: backfill location if missing
+  if not src.zone or not src.subzone or src.x == nil or src.y == nil then
+    local z, s, x, y = EH.Pos()
+    src.zone = src.zone or z
+    src.subzone = src.subzone or s
+    if src.x == nil then src.x = x end
+    if src.y == nil then src.y = y end
+  end
+
   local key = src.id and tostring(src.id) or (src.guid and tostring(src.guid)) or nil
   if not key then return end
   PUSH({
@@ -485,9 +501,13 @@ local function PushKillEventFromSource(src)
   log("kill " .. key)
 end
 
+
+-- Prefer GameObject GUIDs when present; otherwise fall back to Creature.
 local function DetectLootSource()
   if not GetLootSourceInfo then return nil, nil, nil end
   local num = GetNumLootItems() or 0
+  local goGuid, goEntry
+  local mobGuid, mobEntry
   for slot = 1, num do
     local t = { GetLootSourceInfo(slot) }
     if #t >= 1 then
@@ -495,13 +515,44 @@ local function DetectLootSource()
         local guid = t[i]
         if guid then
           local kind = GUIDKind(guid)
-          local entry = GetEntryIdFromGUID(guid)
-          return guid, kind, entry
+          if kind == "GameObject" then
+            if not goGuid then
+              goGuid  = guid
+              goEntry = GetEntryIdFromGUID(guid)
+            end
+          elseif kind == "Creature" then
+            if not mobGuid then
+              mobGuid  = guid
+              mobEntry = GetEntryIdFromGUID(guid)
+            end
+          end
         end
       end
     end
   end
+  if goGuid then return goGuid, "GameObject", goEntry end
+  if mobGuid then return mobGuid, "Creature", mobEntry end
+  -- Fallback: try current target if nothing else reported a source
+  if UnitGUID and UnitGUID("target") then
+    local tg = UnitGUID("target")
+    return tg, GUIDKind(tg), GetEntryIdFromGUID(tg)
+  end
   return nil, nil, nil
+end
+
+-- NEW: collect all loot source GUIDs (set), to safely detect mined corpses.
+local function CollectLootSources()
+  if not GetLootSourceInfo then return nil end
+  local set = {}
+  local num = GetNumLootItems() or 0
+  for slot = 1, num do
+    local t = { GetLootSourceInfo(slot) }
+    for i = 1, #t, 2 do
+      local guid = t[i]
+      if guid then set[guid] = true end
+    end
+  end
+  return set
 end
 
 ------------------------------------------------------------
@@ -714,13 +765,18 @@ local function OnCombatLogEvent(self, event, ...)
           if UnitExists("target") and UnitGUID("target") == dstGUID then
             src = select(1, MobSourceFromUnit("target"))
           end
-          src = src or {
-            kind="mob",
-            id=mid, guid=dstGUID, name=lastMob.name,
-            level=lastMob.level, classification=lastMob.classification,
-            creatureType=lastMob.creatureType, creatureFamily=lastMob.creatureFamily,
-            reaction=lastMob.reaction, maxHp=lastMob.maxHp, maxMana=lastMob.maxMana,
-          }
+do
+  local z, s, x, y = EH.Pos()
+  src = src or {
+    kind="mob",
+    id=mid, guid=dstGUID, name=lastMob.name,
+    level=lastMob.level, classification=lastMob.classification,
+    creatureType=lastMob.creatureType, creatureFamily=lastMob.creatureFamily,
+    reaction=lastMob.reaction, maxHp=lastMob.maxHp, maxMana=lastMob.maxMana,
+    -- NEW
+    zone = z, subzone = s, x = x, y = y,
+  }
+end
           PushKillEventFromSource(src)
         end
       end
@@ -870,16 +926,22 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
     local nodeName   = (EH._currentGather and EH._currentGather.nodeName) or nil
     local gatherKind = (EH._currentGather and EH._currentGather.gatherKind) or ClassifyFromTitle(nodeName) or "Container"
 
-    -- Detect corpse-mining, but DO NOT rename the node; just attach corpse metadata
+    -- Prefer authoritative Creature owner from hint; fallback to timed mouseover
     local corpseMining, corpseGuidLocal, corpseEntryLocal, corpseNameLocal = false, nil, nil, nil
-    if RecentGatherCast("Mining", 12) and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 8) then
-      corpseMining   = true
-      corpseGuidLocal = lastDeadMouseover.guid
+
+    if corpseGUIDHint then
+      corpseGuidLocal  = corpseGUIDHint
+      corpseEntryLocal = GetEntryIdFromGUID(corpseGuidLocal)
+      corpseNameLocal  = (EH.mobSnap[corpseGuidLocal] and EH.mobSnap[corpseGuidLocal].name) or nil
+      corpseMining     = true
+    elseif RecentGatherCast("Mining", 12) and lastDeadMouseover and (now() - (lastDeadMouseover.t or 0) <= 8) then
+      corpseGuidLocal  = lastDeadMouseover.guid
       corpseEntryLocal = GetEntryIdFromGUID(corpseGuidLocal)
       corpseNameLocal  = lastDeadMouseover.name
+      corpseMining     = true
     end
 
-    -- Derive a generic mining node name only if needed (no corpse rename here)
+    -- Derive a generic mining node name only if needed (no corpse renaming)
     if gatherKind == "Mining" and (not nodeName or IsGenericMiningName(nodeName)) then
       local derived = MiningNameFromItems(items)
       if derived then nodeName = derived end
@@ -889,10 +951,10 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
     src  = { kind="gather", gatherKind=gatherKind, nodeId=nodeId, nodeName=nodeName, guid=g }
     sKey = NodeSourceKey(nodeId, nodeName)
 
-    -- Attach corpse meta to the source + hint the event, but keep node id/name unchanged
+    -- Attach corpse meta to the source + propagate hint; keep node id/name unchanged
     if corpseMining and corpseGuidLocal then
       src.corpse = { id = corpseEntryLocal, guid = corpseGuidLocal, name = corpseNameLocal }
-      corpseGUIDHint = corpseGuidLocal
+      if not corpseGUIDHint then corpseGUIDHint = corpseGuidLocal end
     end
   end
 
@@ -978,9 +1040,14 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
 
   -- Attach corpse info to the event (for correlation) without changing naming
   if (lootKind == "Creature" and g) or corpseGUIDHint then
-    ev.corpseGUID  = g or corpseGUIDHint
-    ev.corpseEntry = GetEntryIdFromGUID(ev.corpseGUID)
+    ev.corpseGUID   = g or corpseGUIDHint
+    ev.corpseEntry  = GetEntryIdFromGUID(ev.corpseGUID)
     ev.mobSourceKey = tostring(ev.corpseEntry or ev.corpseGUID)
+
+    -- NEW: for mined corpses (GameObject + corpse hint), also expose mobId explicitly
+    if lootKind == "GameObject" and corpseGUIDHint and ev.corpseEntry then
+      ev.mobId = ev.corpseEntry
+    end
   end
 
   -- attempt counters
@@ -992,12 +1059,13 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
   if not bypassToken then markLootToken(_tok) end
 
   PUSH(ev)
-  log(("loot pushed kind=? src.kind=%s sKey=%s items=%d money=%s corpseGUID=%s token=%s")
+  log(("loot pushed kind=? src.kind=%s sKey=%s items=%d money=%s corpseGUID=%s corpseEntry=%s token=%s")
       :format(tostring(src and src.kind or "?"),
               tostring(sKey),
               tonumber(#(items or {})) or 0,
               tostring(moneyCopper or 0),
               tostring(ev.corpseGUID),
+              tostring(ev.corpseEntry),
               tostring(_tok)))
 end
 
@@ -1059,6 +1127,20 @@ local function OnLootOpened()
   local nodeTitle = _G.LootFrameTitleText and _G.LootFrameTitleText.GetText and _G.LootFrameTitleText:GetText() or nil
   local lootGUID, lootKind, lootEntry = DetectLootSource()
 
+  -- NEW: capture a Creature owner from loot sources when primary is a GameObject (mined corpse case)
+  local corpseGUIDHint = nil
+  if lootKind == "GameObject" then
+    local srcs = CollectLootSources()
+    if srcs then
+      for guid,_ in pairs(srcs) do
+        if GUIDKind(guid) == "Creature" then
+          corpseGUIDHint = guid
+          break
+        end
+      end
+    end
+  end
+
   -- quick intent guess before we consider corpse GUID fallbacks
   local gatherIntent = false
   if containerRecent then gatherIntent = true end
@@ -1084,8 +1166,8 @@ local function OnLootOpened()
   -- Inventory container (bag item) detection (works for lockboxes + clams)
   if EH._pendingBagOpen and (now() - (EH._pendingBagOpen.ts or 0) <= 8) then
     local po = EH._pendingBagOpen
-    if LooksLikeContainerItem(po.name, po.class, po.subClass)
-       and (not lootGUID) or (nodeTitle and ClassifyFromTitle(nodeTitle) == "Container") then
+    if (LooksLikeContainerItem(po.name, po.class, po.subClass) and (not lootGUID))
+       or (nodeTitle and ClassifyFromTitle(nodeTitle) == "Container") then
       EH._currentContainer = { itemId = po.id, itemName = po.name }
       log(("inventory container: %s (id=%s)"):format(tostring(po.name or "?"), tostring(po.id or "?")))
     end
@@ -1155,8 +1237,8 @@ local function OnLootOpened()
     end
   end
 
-  -- Finally, push the loot
-  PushLootEvent(items, (moneyCopper > 0) and moneyCopper or nil, lootGUID, lootKind, lootEntry, nil)
+  -- Finally, push the loot (pass corpseGUIDHint if we found a Creature source alongside a GameObject)
+  PushLootEvent(items, (moneyCopper > 0) and moneyCopper or nil, lootGUID, lootKind, lootEntry, corpseGUIDHint)
 end
 
 ------------------------------------------------------------
