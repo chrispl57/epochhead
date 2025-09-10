@@ -362,6 +362,7 @@ class App(tk.Tk):
         self._last_sig = None  # (mtime_ns, size)
         self._last_success_at = 0.0
         self._last_upload_ts = None
+        self._uploading = False
 
         cfg = load_config()
         sv_dir = cfg.get("sv_dir")
@@ -515,6 +516,8 @@ class App(tk.Tk):
                     kind, payload = item, {}
                 if kind == "upload":
                     self._do_upload(manual=bool(payload.get("manual")))
+                elif kind == "upload_result":
+                    self._finish_upload(payload.get("path"), payload.get("code"), payload.get("body"))
                 elif kind == "show":
                     self.deiconify()
                     try: self.lift(); self.focus_force()
@@ -617,6 +620,9 @@ class App(tk.Tk):
         threading.Timer(secs, lambda: self.queue.put(("upload", {"manual": False}))).start()
 
     def _do_upload(self, *, manual: bool):
+        if self._uploading:
+            self._log("Upload already in progress; skipping.")
+            return
         p = self._sv_file_path()
         if not p:
             self._log("Select the SavedVariables folder first.")
@@ -672,9 +678,20 @@ class App(tk.Tk):
         payload = {"events": events, "meta": meta}
 
         self._log("Uploading…")
-        def call(): return post_upload(SERVER, TOKEN, payload, endpoint=UPLOAD_ENDPOINT)
+        self._uploading = True
 
-        code, body = _net_call_with_backoff(call)
+        def worker():
+            try:
+                code, body = _net_call_with_backoff(
+                    lambda: post_upload(SERVER, TOKEN, payload, endpoint=UPLOAD_ENDPOINT)
+                )
+            except Exception as e:
+                code, body = 0, str(e)
+            self.queue.put(("upload_result", {"path": p, "code": code, "body": body}))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_upload(self, p, code, body):
         ok = 200 <= int(code or 0) < 300
         self.server_ok = bool(ok)
 
@@ -698,7 +715,7 @@ class App(tk.Tk):
         if isinstance(av, dict):
             client = av.get("client") or av.get("addon") or ""
             target = av.get("target") or ""
-            do_warn= bool(av.get("warn"))
+            do_warn = bool(av.get("warn"))
             if do_warn and client and target:
                 warn = f"Addon {client} is behind target {target}. Please update."
         if warn:
@@ -713,7 +730,7 @@ class App(tk.Tk):
         self._log(f"Upload -> {code}")
         if body:
             try:
-                preview = (body[:600] + ("…" if len(body) > 600 else "")).replace("\n"," ").strip()
+                preview = (body[:600] + ("…" if len(body) > 600 else "")).replace("\n", " ").strip()
                 self._log(preview)
             except Exception:
                 pass
@@ -730,6 +747,8 @@ class App(tk.Tk):
                 self._log(f"Rename failed: {e}")
         elif ok:
             self._last_success_at = time.time()
+
+        self._uploading = False
 
 # --------------- Entrypoint ---------------
 def main():
