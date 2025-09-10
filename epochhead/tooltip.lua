@@ -85,8 +85,30 @@ local function tooltipRecord()
     if txt and txt ~= "" then EH.lastTooltipTitle = txt end
   end
 end
+-- Deduplicate tooltip logs per item ID for the current session
+local seenTooltipItems = {}
+
+local function logItemTooltip(tip)
+  local name, link = tip:GetItem()
+  if not link or not EH or not EH.push then return end
+  local entry = EH.BuildItemEntry and EH.BuildItemEntry(link, name, 1, nil) or { name = name }
+  local iid = entry and entry.id
+  if iid and seenTooltipItems[iid] then return end
+  if iid then seenTooltipItems[iid] = true end
+  EH.push({
+    type = "item_info",
+    t = EH.now and EH.now() or time(),
+    item = entry,
+  })
+end
+
 if GameTooltip and GameTooltip.HookScript then
   GameTooltip:HookScript("OnShow", tooltipRecord)
   GameTooltip:HookScript("OnTooltipSetItem", tooltipRecord)
   GameTooltip:HookScript("OnUpdate", tooltipRecord)
+  GameTooltip:HookScript("OnTooltipSetItem", logItemTooltip)
+end
+
+if ItemRefTooltip and ItemRefTooltip.HookScript then
+  ItemRefTooltip:HookScript("OnTooltipSetItem", logItemTooltip)
 end

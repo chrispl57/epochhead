@@ -99,7 +99,11 @@ local function clamp()
 end
 
 function EH.push(ev)
-  ev.session = epochheadDB.state and epochheadDB.state.sessionId or nil
+  -- Ensure core tables are initialized before logging
+  epochheadDB.state = epochheadDB.state or {}
+  epochheadDB.events = epochheadDB.events or {}
+
+  ev.session = epochheadDB.state.sessionId
 
   if epochheadDB.meta and epochheadDB.meta.player then
     local p = epochheadDB.meta.player
@@ -109,7 +113,6 @@ function EH.push(ev)
     end
     -- realm gate using metadata
     if not EH.isRealmAllowed(p.realm) then
-      epochheadDB.state = epochheadDB.state or {}
       epochheadDB.state.droppedByRealm = (epochheadDB.state.droppedByRealm or 0) + 1
       if epochheadDB.state.debug then
         DEFAULT_CHAT_FRAME:AddMessage("|cff99ccff[epochhead]|r drop (realm not allowed): "..tostring(p.realm or "?"))

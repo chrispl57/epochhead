@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.27
+-- Version: 0.9.28
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.27"
+EH.VERSION   = "0.9.28"
 
 ------------------------------------------------------------
 -- Logging helpers
