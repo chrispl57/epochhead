@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.28
+-- Version: 0.9.29
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.28"
+EH.VERSION   = "0.9.29"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -1316,11 +1316,13 @@ local function OnQuestAccepted(a1, a2)
   local title; if GetQuestLogTitle then local ok, t = pcall(function() local r = { GetQuestLogTitle(questIndex) } return r[1] end); if ok then title = t end end
   local description, objectives; if GetQuestLogQuestText then local ok, d,o = pcall(GetQuestLogQuestText); if ok then description, objectives = d,o end end
   local qid = questId or (questIndex and GetQuestIdFromLogIndex(questIndex)) or FindQuestIDByTitle(title)
+  local z, s, x, y = EH.Pos()
   local ev = {
     type = "quest", subtype = "accept", t = now(), session = EH.session,
     id = qid, title = title, text = description, objectives = objectives,
     giver = BuildNPCFromUnit("target"),
     rewardsPreview = CaptureQuestLogRewards(questIndex),
+    zone = z, subzone = s, x = x, y = y,
   }
   if qid then PUSH(ev); EH._pendingQuestAccept = nil else EH._pendingQuestAccept = { idx = questIndex, ev = ev, ts = now() } end
 end
