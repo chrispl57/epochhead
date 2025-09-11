@@ -314,23 +314,92 @@ def _normalize_inplace(obj):
         for v in obj: _normalize_inplace(v)
 
 # --------------- Networking ---------------
-def post_upload(server: str, token: str, payload: dict, endpoint: str = UPLOAD_ENDPOINT, timeout=30):
+def post_upload(server: str, token: str, payload: dict,
+                endpoint: str = UPLOAD_ENDPOINT,
+                timeout=(30, 300), chunk_size=64 * 1024):
+    """POST data to the upload endpoint with generous timeouts.
+
+    The timeout parameter accepts a tuple of ``(connect_timeout, read_timeout)``
+    so the client can wait longer for the server to finish processing the
+    request.  The payload is streamed in chunks to avoid buffering very large
+    uploads in memory.
+
+    Returns a ``(status_code, body)`` tuple.  On network errors, ``status_code``
+    will be ``0`` and ``body`` will contain the exception string.
+    """
     import json as _json
-    from urllib.request import Request, urlopen
-    from urllib.error import URLError, HTTPError
+    import socket
+    import http.client
+    import urllib.parse
+
+    connect_timeout, read_timeout = (
+        timeout if isinstance(timeout, tuple) else (timeout, timeout)
+    )
+
     url = server.rstrip("/") + endpoint
+    parsed = urllib.parse.urlsplit(url)
     body = _json.dumps({"token": token, "payload": payload}).encode("utf-8")
-    req = Request(url, data=body,
-                  headers={"Content-Type":"application/json",
-                           "User-Agent": f"EpochUploader/{APP_VERSION} (Windows)"},
-                  method="POST")
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": f"EpochUploader/{APP_VERSION} (Windows)",
+    }
+
+    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    conn = conn_cls(parsed.hostname, port, timeout=connect_timeout)
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8","ignore")
-    except HTTPError as e:
-        return e.code, e.read().decode("utf-8","ignore")
-    except URLError as e:
+        conn.connect()
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        conn.putrequest("POST", path, skip_accept_encoding=True)
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()
+        for i in range(0, len(body), chunk_size):
+            conn.send(body[i : i + chunk_size])
+        conn.sock.settimeout(read_timeout)
+        resp = conn.getresponse()
+        data = resp.read().decode("utf-8", "ignore")
+        return resp.status, data
+    except (socket.timeout, ConnectionResetError, OSError) as e:
         return 0, str(e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def get_upload_status(server: str, job_id: str, timeout=30):
+    import socket, http.client, urllib.parse
+
+    url = server.rstrip("/") + f"/upload/status/{job_id}"
+    parsed = urllib.parse.urlsplit(url)
+
+    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    conn = conn_cls(parsed.hostname, port, timeout=timeout)
+    try:
+        conn.connect()
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        conn.putrequest("GET", path, skip_accept_encoding=True)
+        conn.putheader("User-Agent", f"EpochUploader/{APP_VERSION} (Windows)")
+        conn.endheaders()
+        conn.sock.settimeout(timeout)
+        resp = conn.getresponse()
+        data = resp.read().decode("utf-8", "ignore")
+        return resp.status, data
+    except (socket.timeout, ConnectionResetError, OSError) as e:
+        return 0, str(e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def _net_call_with_backoff(call):
     delay = 0.5
@@ -687,7 +756,37 @@ class App(tk.Tk):
                 )
             except Exception as e:
                 code, body = 0, str(e)
-            self.queue.put(("upload_result", {"path": p, "code": code, "body": body}))
+
+            job_id = None
+            if body:
+                try:
+                    job_id = json.loads(body).get("job_id")
+                except Exception:
+                    pass
+
+            if job_id and 200 <= int(code or 0) < 400:
+                def poll():
+                    while True:
+                        time.sleep(1.0)
+                        try:
+                            scode, sbody = _net_call_with_backoff(
+                                lambda: get_upload_status(SERVER, job_id)
+                            )
+                        except Exception as e2:
+                            scode, sbody = 0, str(e2)
+                        finished = False
+                        if sbody:
+                            try:
+                                sj = json.loads(sbody)
+                                finished = bool(sj.get("finished"))
+                            except Exception:
+                                pass
+                        if finished:
+                            self.queue.put(("upload_result", {"path": p, "code": scode, "body": sbody}))
+                            break
+                threading.Thread(target=poll, daemon=True).start()
+            else:
+                self.queue.put(("upload_result", {"path": p, "code": code, "body": body}))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -703,15 +802,19 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # Counts – support old/new backends
-        self.created    = server.get("created")
-        self.updated    = server.get("updated")
-        self.dropped    = server.get("dropped") or server.get("dropped_by_realm")
-        self.duplicates = server.get("dropped_duplicates") or server.get("duplicates")
+        result = server.get("result") if isinstance(server, dict) else None
+        if result is None:
+            result = server if isinstance(server, dict) else {}
+
+        totals = ((result.get("stats") or {}).get("totals") or {}) if isinstance(result, dict) else {}
+        self.created    = totals.get("created") or result.get("created")
+        self.updated    = totals.get("updated") or result.get("updated")
+        self.dropped    = result.get("dropped_by_realm") or result.get("dropped")
+        self.duplicates = result.get("dropped_dupes") or result.get("dropped_duplicates") or result.get("duplicates")
 
         # Addon version warning
         warn = None
-        av = server.get("addonVersion") or server.get("addon_version") or {}
+        av = result.get("addonVersion") or result.get("addon_version") or {}
         if isinstance(av, dict):
             client = av.get("client") or av.get("addon") or ""
             target = av.get("target") or ""
