@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.29
+-- Version: 0.9.30
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.29"
+EH.VERSION   = "0.9.30"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -572,6 +572,7 @@ end
 local FISHING_SPELL_IDS   = { [7732]=true, [7620]=true, [18248]=true}
 local MINING_SPELL_IDS    = { [2575]=true }     -- "Mining"
 local HERBALISM_SPELL_IDS = { [2366]=true }     -- "Herb Gathering"
+local SKINNING_SPELL_IDS  = { [8613]=true }     -- "Skinning"
 
 local function MarkGatherCast(kind)
   EH._lastGatherCast = { kind = kind, ts = now() }
@@ -597,6 +598,11 @@ local function isHerbName(spellName)
   local s = spellName:lower()
   return s:find("herb", 1, true) ~= nil or s:find("gather", 1, true) ~= nil
 end
+local function isSkinningName(spellName)
+  if not spellName then return false end
+  local s = spellName:lower()
+  return s:find("skin", 1, true) ~= nil
+end
 
 if not EH.OnSpellcastSucceeded then
   function EH.OnSpellcastSucceeded(unit, spell, rank, lineId, spellID)
@@ -617,6 +623,9 @@ if not EH.OnSpellcastSucceeded then
     end
     if (type(spellID) == "number" and HERBALISM_SPELL_IDS[spellID]) or isHerbName(spell) then
       MarkGatherCast("Herbalism"); log("gather cast: Herbalism"); return
+    end
+    if (type(spellID) == "number" and SKINNING_SPELL_IDS[spellID]) or isSkinningName(spell) then
+      MarkGatherCast("Skinning"); log("gather cast: Skinning"); return
     end
   end
 end
@@ -881,6 +890,50 @@ local function IsGenericMiningName(name)
   return (low == "mining node") or (low == "node") or (low == "deposit") or (low == "vein")
 end
 
+-- Herbalism helpers (mirror Mining logic)
+local function HerbNameFromItems(items)
+  if type(items) ~= "table" then return nil end
+  local herb
+  for _, it in ipairs(items) do
+    local nm = (it and it.info and it.info.name) or (it and it.name) or nil
+    if nm and nm ~= "" then
+      local low = nm:lower()
+      if low:find("bloom") or low:find("flower") or low:find("weed") or low:find("herb")
+         or low:find("lotus") or low:find("gromsblood") or low:find("mageroyal")
+         or low:find("peacebloom") or low:find("kingsblood") or low:find("dreamfoil")
+         or low:find("goldthorn") then
+        herb = nm
+        break
+      end
+    end
+  end
+  if herb then return (herb .. " Node") end
+  return nil
+end
+
+local function IsHerbLoot(items)
+  if type(items) ~= "table" then return false end
+  local kw = {
+    "bloom", "flower", "weed", "herb", "lotus",
+    "gromsblood", "mageroyal", "peacebloom", "kingsblood",
+    "dreamfoil", "goldthorn",
+  }
+  for _, it in ipairs(items) do
+    local nm = (it and it.info and it.info.name) or (it and it.name) or ""
+    local l = nm:lower()
+    for _, k in ipairs(kw) do
+      if l:find(k, 1, true) then return true end
+    end
+  end
+  return false
+end
+
+local function IsGenericHerbName(name)
+  if not name or name == "" then return true end
+  local low = name:lower()
+  return (low == "herb node") or (low == "herbalism node") or (low == "herb") or (low == "node")
+end
+
 ------------------------------------------------------------
 -- Loot handler
 ------------------------------------------------------------
@@ -894,6 +947,7 @@ end
 local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, corpseGUIDHint)
   local src, sKey, g = nil, nil, lootGUID
   local hasSource = (g ~= nil)
+  local isSkinning = RecentGatherCast("Skinning", 12)
 
   -- Inventory container (bag item opened)
   if EH._currentContainer then
@@ -941,11 +995,15 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
       corpseMining     = true
     end
 
-    -- Derive a generic mining node name only if needed (no corpse renaming)
+    -- Derive a generic Mining/Herbalism node name only if needed (no corpse renaming)
     if gatherKind == "Mining" and (not nodeName or IsGenericMiningName(nodeName)) then
       local derived = MiningNameFromItems(items)
       if derived then nodeName = derived end
       if not nodeName or nodeName == "" then nodeName = "Mining Node" end
+    elseif gatherKind == "Herbalism" and (not nodeName or IsGenericHerbName(nodeName)) then
+      local derived = HerbNameFromItems(items)
+      if derived then nodeName = derived end
+      if not nodeName or nodeName == "" then nodeName = "Herbalism Node" end
     end
 
     src  = { kind="gather", gatherKind=gatherKind, nodeId=nodeId, nodeName=nodeName, guid=g }
@@ -966,6 +1024,10 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
       local derived = MiningNameFromItems(items)
       if derived then nodeName = derived end
       if not nodeName or nodeName == "" then nodeName = "Mining Node" end
+    elseif gk == "Herbalism" and (not nodeName or IsGenericHerbName(nodeName)) then
+      local derived = HerbNameFromItems(items)
+      if derived then nodeName = derived end
+      if not nodeName or nodeName == "" then nodeName = "Herbalism Node" end
     end
     src  = { kind="gather", gatherKind=gk, nodeId=EH._currentGather.nodeId, nodeName=nodeName, guid=g }
     sKey = NodeSourceKey(EH._currentGather.nodeId, nodeName)
@@ -1006,7 +1068,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
   end
 
   -- GUID loot de-dupe
-  if hasSource and lootKind == "Creature"   and lootSeenRecently(g) then log("loot skipped (corpse GUID cooldown) guid="..tostring(g)); return end
+  if hasSource and lootKind == "Creature"   and lootSeenRecently(g) and not isSkinning then log("loot skipped (corpse GUID cooldown) guid="..tostring(g)); return end
   if hasSource and lootKind == "GameObject" and lootSeenRecently(g) then log("loot skipped (gameobject GUID cooldown) guid="..tostring(g)); return end
 
   -- Ensure sourceKey
@@ -1053,6 +1115,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
   -- attempt counters
   if src and src.kind == "gather"     then ev.attempt = 1 end
   if src and src.kind == "container"  then ev.attempt = 1 end
+  if isSkinning                       then ev.profession = "skinning"; ev.attempt = 1 end
 
   if hasSource and lootKind == "Creature"   then markLoot(g) end
   if hasSource and lootKind == "GameObject" then markLoot(g) end
@@ -1145,7 +1208,7 @@ local function OnLootOpened()
   local gatherIntent = false
   if containerRecent then gatherIntent = true end
   if nodeTitle and nodeTitle ~= "" and ClassifyFromTitle(nodeTitle) then gatherIntent = true end
-  if RecentGatherCast("Mining", 12) or RecentGatherCast("Herbalism", 12) then gatherIntent = true end
+  if RecentGatherCast("Mining", 12) or RecentGatherCast("Herbalism", 12) or RecentGatherCast("Skinning", 12) then gatherIntent = true end
 
   -- If no GUID and this does not look like gather, try corpse GUID fallback (restores corpse dedupe)
   if (not lootGUID) and (not gatherIntent) then
@@ -1208,8 +1271,10 @@ local function OnLootOpened()
 
     local kind = RecentGatherCast("Mining", 12) and "Mining" or "Herbalism"
 
-    -- Require mining-like loot to claim Mining; avoids mis-tagging mob loot
+    -- Require mining/herb-like loot to claim gather; avoids mis-tagging mob loot
     if kind == "Mining" and not IsMiningLoot(items) then
+      kind = nil
+    elseif kind == "Herbalism" and not IsHerbLoot(items) then
       kind = nil
     end
 
@@ -1222,6 +1287,9 @@ local function OnLootOpened()
       end
       if (not inferredName or IsGenericMiningName(inferredName)) and kind == "Mining" then
         local derived = MiningNameFromItems(items)
+        if derived then inferredName = derived end
+      elseif (not inferredName or IsGenericHerbName(inferredName)) and kind == "Herbalism" then
+        local derived = HerbNameFromItems(items)
         if derived then inferredName = derived end
       end
       inferredName = inferredName or (kind .. " Node")
