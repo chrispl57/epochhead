@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.30
+-- Version: 0.9.31
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.30"
+EH.VERSION   = "0.9.31"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -111,6 +111,7 @@ end
 EH.session = EH.session or make_session()
 EH._debug  = EH._debug or false
 EH._loadedPrinted = EH._loadedPrinted or false
+EH._lastPickpocket = EH._lastPickpocket or nil
 
 ------------------------------------------------------------
 -- GUID utils
@@ -456,16 +457,18 @@ local function ItemsSignature(items, moneyCopper)
   return table.concat(parts, "|")
 end
 
-local function BuildLootToken(src, sKey, g, lootKind, items, moneyCopper)
+local function BuildLootToken(src, sKey, g, lootKind, items, moneyCopper, isPickpocket)
   local sig = ItemsSignature(items, moneyCopper)
   local typ = src and src.kind or "unknown"
   if typ == "container" and src and src.containerKind == "item" then
     local idOrName = (src.itemId and tostring(src.itemId)) or (src.itemName and tostring(src.itemName)) or (sKey and tostring(sKey)) or "?"
     return "icont:"..idOrName.."|"..sig
-  elseif lootKind == "GameObject" and g then
-    return "go:"..tostring(g).."|"..sig
-  elseif lootKind == "Creature" and g then
-    return "corpse:"..tostring(g).."|"..sig
+    elseif lootKind == "GameObject" and g then
+      return "go:"..tostring(g).."|"..sig
+    elseif isPickpocket and g then
+      return "pickpocket:"..tostring(g).."|"..sig
+    elseif lootKind == "Creature" and g then
+      return "corpse:"..tostring(g).."|"..sig
   elseif typ == "gather" then
     local nid = (src and src.nodeId) and tostring(src.nodeId) or "?"
     local nname = (src and src.nodeName) and tostring(src.nodeName) or ""
@@ -617,6 +620,13 @@ if not EH.OnSpellcastSucceeded then
       return
     end
 
+    -- Pickpocket tracking
+    if (type(spellID) == "number" and spellID == 921) or (spell and spell:lower() == "pick pocket") then
+      EH._lastPickpocket = { ts = now(), guid = UnitGUID("target") }
+      log("pickpocket spell cast")
+      return
+    end
+
     -- Mining / Herbalism tracking (best-effort)
     if (type(spellID) == "number" and MINING_SPELL_IDS[spellID]) or isMiningName(spell) then
       MarkGatherCast("Mining");  log("gather cast: Mining");  return
@@ -748,6 +758,9 @@ local function OnCombatLogEvent(self, event, ...)
         MarkGatherCast("Mining")
       elseif (spellId and HERBALISM_SPELL_IDS[spellId]) or isHerbName(spellName) then
         MarkGatherCast("Herbalism")
+      elseif (spellId == 921) or (spellName and spellName:lower() == "pick pocket") then
+        EH._lastPickpocket = { ts = now(), guid = dstGUID }
+        log("pickpocket CLEU")
       end
     end
   end
@@ -944,10 +957,11 @@ local function IsProbablyMobName(name)
   return false
 end
 
-local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, corpseGUIDHint)
+local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, corpseGUIDHint, isPickpocket)
   local src, sKey, g = nil, nil, lootGUID
   local hasSource = (g ~= nil)
   local isSkinning = RecentGatherCast("Skinning", 12)
+  isPickpocket = isPickpocket or false
 
   -- Inventory container (bag item opened)
   if EH._currentContainer then
@@ -1061,8 +1075,8 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
     lootKind  = "Creature"
   end
 
-  -- Kill credit only for mobs
-  if src and src.kind == "mob" and g and not killSeenRecently(g) then
+  -- Kill credit only for mobs (skip for pickpocket)
+  if src and src.kind == "mob" and g and not killSeenRecently(g) and not isPickpocket then
     markKill(g)
     PushKillEventFromSource(src)
   end
@@ -1081,9 +1095,9 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
     end
   end
 
-  -- Token de-dupe (bypass for gather and inventory-item containers)
-  local _tok = BuildLootToken(src, sKey, g, lootKind, items, moneyCopper)
-  local bypassToken = (src and src.kind == "gather") or (src and src.kind == "container" and src.containerKind == "item")
+    -- Token de-dupe (bypass for gather and inventory-item containers)
+    local _tok = BuildLootToken(src, sKey, g, lootKind, items, moneyCopper, isPickpocket)
+    local bypassToken = (src and src.kind == "gather") or (src and src.kind == "container" and src.containerKind == "item")
   if not bypassToken and lootTokenSeenRecently(_tok) then
     log("loot skipped (token cooldown) token="..tostring(_tok))
     return
@@ -1113,9 +1127,10 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
   end
 
   -- attempt counters
-  if src and src.kind == "gather"     then ev.attempt = 1 end
-  if src and src.kind == "container"  then ev.attempt = 1 end
-  if isSkinning                       then ev.profession = "skinning"; ev.attempt = 1 end
+    if src and src.kind == "gather"     then ev.attempt = 1 end
+    if src and src.kind == "container"  then ev.attempt = 1 end
+    if isSkinning                       then ev.profession = "skinning"; ev.attempt = 1 end
+    if isPickpocket                     then ev.profession = "pickpocket"; ev.attempt = 1 end
 
   if hasSource and lootKind == "Creature"   then markLoot(g) end
   if hasSource and lootKind == "GameObject" then markLoot(g) end
@@ -1226,6 +1241,14 @@ local function OnLootOpened()
   log(("LOOT_OPENED: lootGUID=%s lootKind=%s entry=%s title=%s")
       :format(tostring(lootGUID), tostring(lootKind), tostring(lootEntry), tostring(nodeTitle or "")))
 
+  -- Detect pickpocket (recent spell cast on same GUID)
+  local isPickpocket = false
+  if EH._lastPickpocket and (now() - (EH._lastPickpocket.ts or 0) <= 5) then
+    if lootGUID and EH._lastPickpocket.guid == lootGUID then
+      isPickpocket = true
+    end
+  end
+
   -- Inventory container (bag item) detection (works for lockboxes + clams)
   if EH._pendingBagOpen and (now() - (EH._pendingBagOpen.ts or 0) <= 8) then
     local po = EH._pendingBagOpen
@@ -1306,7 +1329,8 @@ local function OnLootOpened()
   end
 
   -- Finally, push the loot (pass corpseGUIDHint if we found a Creature source alongside a GameObject)
-  PushLootEvent(items, (moneyCopper > 0) and moneyCopper or nil, lootGUID, lootKind, lootEntry, corpseGUIDHint)
+  PushLootEvent(items, (moneyCopper > 0) and moneyCopper or nil, lootGUID, lootKind, lootEntry, corpseGUIDHint, isPickpocket)
+  EH._lastPickpocket = nil
 end
 
 ------------------------------------------------------------
