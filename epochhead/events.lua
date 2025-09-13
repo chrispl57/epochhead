@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.31
+-- Version: 0.9.32
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.31"
+EH.VERSION   = "0.9.32"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -960,7 +960,7 @@ end
 local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, corpseGUIDHint, isPickpocket)
   local src, sKey, g = nil, nil, lootGUID
   local hasSource = (g ~= nil)
-  local isSkinning = RecentGatherCast("Skinning", 12)
+  local isSkinning = RecentGatherCast("Skinning", 2.5)
   isPickpocket = isPickpocket or false
 
   -- Inventory container (bag item opened)
