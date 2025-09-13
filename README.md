@@ -1,114 +1,123 @@
 # EpochHead
 
-> **📥 WINDOWS USERS — NO PYTHON REQUIRED**  
-> **Download the ready-made uploader here:**  
-> 👉 **[epoch_uploader.exe (Latest Releases)](../../releases/latest/download/epoch_uploader.exe)**  
-> *(If that direct link doesn’t work in your viewer, open the Releases page: [See all releases →](../../releases))*
+Community‑powered data collection for **Project Epoch (Classic WoW 3.3.5a)** — a lightweight **in‑game addon** plus an optional **desktop uploader** that ships your collected data to the EpochHead backend for indexing and search.
 
-Community-powered data collection for Project Epoch (Classic WoW): a lightweight in-game addon plus a desktop uploader that ships collected data to your backend for indexing and search.
+- **Website:** <https://epochhead.com>
+- **Releases (Windows uploader .exe):** <https://github.com/chrispl57/epochhead/releases/latest>
+- **Manual upload (Linux/macOS or anyone preferring a browser):** <https://epochhead.com/upload>
+
+* * *
 
 > **What’s here?**
 >
-> - **WoW Addon** (3.3.5a-safe) — logs kills, loot, quests, fishing, etc. into `SavedVariables\epochhead.lua`.
-> - **Windows Uploader** — watches your `SavedVariables` folder; when `epochhead.lua` changes, it uploads and then archives the file with a timestamp.
+> - **WoW Addon (3.3.5a‑safe)** — logs kills, loot, containers, fishing, quest choices, vendors, and money events into `SavedVariables\epochhead.lua`.
+> - **Windows Uploader (Recommended)** — watches your `SavedVariables` folder; when `epochhead.lua` changes, it uploads automatically and archives the file with a timestamp.
+> - **Manual Upload** — a web page for Linux/macOS (or anyone) to upload `epochhead.lua` via browser.
 
----
+* * *
 
-## 🚀 Quick Start (Windows – recommended)
-
-1. **Download:** 👉 **[epoch_uploader.exe](../../releases/latest/download/epoch_uploader.exe)**  
-   *(Or open [Releases](../../releases) and grab `epoch_uploader.exe` from the latest tag.)*
-2. **Run it.** On first launch, **select your SavedVariables folder** (the folder, not the file), e.g.:  
-   ```
-   <WoW 3.3.5a>\WTF\Account\<ACCOUNTNAME>\SavedVariables
-   ```
-3. Play normally. Whenever `epochhead.lua` updates, the uploader **auto-uploads** it and then **archives** it as:  
-   `epochhead_uploadYYYYmmdd-HHMMSS.lua`
-
-> 🧰 SmartScreen note: Windows may warn about unrecognized apps. Click **More info → Run anyway**, or build from source (below).
-
----
-
-## Repository Layout
+## Repository layout
 
 ```
 /EpochHead/       # The WoW addon (place into Interface/AddOns on 3.3.5a clients)
-/uploader/        # The desktop uploader (source used to build epoch_uploader.exe)
+/uploader/        # The desktop uploader (Python source, optional if you don't use the .exe)
 ```
 
----
+* * *
 
-## How It Works (end-to-end)
+## How it works (end‑to‑end)
 
-1. **Install the addon** and play normally.
+1. Install the addon and play normally.
 2. The addon writes events to:  
    `GAMEDIR\WTF\Account\ACCOUNTNAME\SavedVariables\epochhead.lua`
-3. **Run the uploader app**:
-   - On first launch it asks for the **SavedVariables folder** (not the file).  
-     Example: `GAMEDIR\WTF\Account\ACCOUNTNAME\SavedVariables`
-   - It **watches** for changes to `epochhead.lua` and **auto-uploads**.
-   - On **success**, it **renames** the file to `epochhead_uploadYYYYmmdd-HHMMSS.lua` to prevent re-uploads.
-   - Closing the window keeps it running in the background (single-instance behavior).
+3. **Choose one upload method:**
+   - **Windows (recommended):** run the uploader; it auto‑uploads on changes and renames the file to prevent re‑uploads.
+   - **Linux/macOS or browser:** visit <https://epochhead.com/upload> and select your `epochhead.lua`.
 
----
+* * *
 
-## Addon Installation
+## Addon installation
 
 1. Copy the addon folder to your WoW client:
-   ```
-   <WoW 3.3.5a>\Interface\AddOns\EpochHead
-   ```
+
+       <WoW 3.3.5a>\Interface\AddOns\EpochHead
+
 2. Enable **EpochHead** at the character select screen → AddOns.
-3. Optional in-game commands:
+3. Optional in‑game commands:
    - `/eh` — ping
    - `/eh debug on` — verbose logging in chat
    - `/eh debug off` — stop verbose logging
 
-> The addon writes to `SavedVariables\epochhead.lua`, which the uploader monitors.
+> The addon writes to `SavedVariables\epochhead.lua` under your account folder, which the uploader (or web upload) consumes.
 
----
+* * *
 
-## 🐍 Prefer to Build the Uploader Yourself?
+## Uploading your data
 
-> You don’t need Python if you use the EXE above. This section is only for folks who want to build locally.
+### ✅ Windows (Recommended) — use the prebuilt uploader
 
-1. Install **Python 3.9+** and pip.
-2. Install **PyInstaller**:
-   ```bash
-   python -m pip install --upgrade pip
-   python -m pip install pyinstaller
-   ```
-3. From the `/uploader` folder:
-   ```bash
-   python -m PyInstaller --onefile --name epoch_uploader --noconsole epoch_uploader.py
-   ```
-4. The binary will be in: `dist/epoch_uploader.exe`
+- **Get the .exe:** Download **`epoch_uploader.exe`** from the **[Releases page](https://github.com/chrispl57/epochhead/releases/latest)**.
+- Run it. It watches your `SavedVariables` folder; when `epochhead.lua` changes, it uploads automatically and archives the file with a timestamp.
 
----
+> If you prefer to build the uploader yourself, the Python source is in `/uploader/` and can be packaged with PyInstaller. The .exe is still the simplest path for Windows users.
+
+### 🌐 Linux / macOS — use the web upload
+
+- Go to **<https://epochhead.com/upload>** and select your `epochhead.lua`.
+- Click **Upload**. That’s it.
+
+**Optional CLI (any OS):**
+```bash
+# Replace the path with your SavedVariables location
+curl -X POST "https://epochhead.com/upload" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@/path/to/WTF/Account/<ACCOUNT_NAME>/SavedVariables/epochhead.lua"
+```
+
+* * *
+
+## Typical data locations
+
+**SavedVariables file to upload:**
+- **Windows:**  
+  `C:\Program Files (x86)\World of Warcraft\WTF\Account\<ACCOUNT_NAME>\SavedVariables\epochhead.lua`  
+  *(Your WoW folder may be outside Program Files on private clients; adjust accordingly.)*
+- **macOS:**  
+  `/Applications/World of Warcraft/WTF/Account/<ACCOUNT_NAME>/SavedVariables/epochhead.lua`  
+  *(Or the path where you installed your 3.3.5a client.)*
+- **Linux (Wine/Proton):**  
+  `<WoW folder>/WTF/Account/<ACCOUNT_NAME>/SavedVariables/epochhead.lua`
+
+* * *
 
 ## Troubleshooting
 
-- **Nothing uploads**
-  - Make sure you selected the **folder** `…\SavedVariables`, not the Lua file itself.
-  - Confirm the game actually wrote a fresh `epochhead.lua` (log out or `/reload`).
-- **Uploader says “file not found”**
-  - Verify you’re pointing at the correct WoW account folder (private servers often use custom account names).
-- **Duplicates**
-  - Files are renamed on success. If you see re-uploads, check the server returns HTTP 200 and merges correctly.
-- **Windows blocks the EXE**
-  - Use “More info → Run anyway”, or build locally with PyInstaller.
+- **Uploader can’t find my SavedVariables folder**  
+  Point it to your **client’s actual install path** (private clients often live outside `Program Files`).
 
----
+- **Large or slow uploads**  
+  That’s normal for first‑time uploads; subsequent uploads only send new data.
 
-## Roadmap
+- **Addon error or blocked action**  
+  Some client UIs block certain protected actions. These warnings don’t affect data capture and can be ignored unless they prevent normal gameplay. Please open an Issue with a screenshot if it’s disruptive.
 
-- More event types (trainers, vendors) parity and richer tooltips.
-- Optional metrics in the uploader (throughput, last response).
+- **I uploaded the wrong file**  
+  Re‑upload the correct `epochhead.lua`. The backend uses de‑dupe and merging; duplicates are ignored.
 
----
+- **`epochhead.lua` not found**  
+  The file is written on **/reload** or **game exit**. The uploader automatically renames it after a successful upload; seeing “not found” right after an upload is expected for new users or immediately post‑upload.
 
-## Credits
+* * *
 
-Thanks to the Project Epoch community and contributors who gather and upload data.
+## Contributing
 
-Issues with uploader/addon? Open an issue or contact on Discord: **_ macetotheface _**.
+Issues and PRs are welcome! If you’re adding new event types or improving de‑dupe/merging, please include:
+- A short description of the new fields/events.
+- Example snippets from `epochhead.lua`.
+- Any migration or backfill logic required on the server side.
+
+* * *
+
+## Disclaimer
+
+EpochHead is a community fan project. It is not affiliated with Blizzard Entertainment. Use at your own risk on private clients. Do not use for commercial purposes.
