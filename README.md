@@ -95,9 +95,6 @@ curl -X POST "https://epochhead.com/upload" \
 - **Uploader can’t find my SavedVariables folder**  
   Point it to your **client’s actual install path** (private clients often live outside `Program Files`).
 
-- **Large or slow uploads**  
-  That’s normal for first‑time uploads; subsequent uploads only send new data.
-
 - **Addon error or blocked action**  
   Some client UIs block certain protected actions. These warnings don’t affect data capture and can be ignored unless they prevent normal gameplay. Please open an Issue with a screenshot if it’s disruptive.
 
