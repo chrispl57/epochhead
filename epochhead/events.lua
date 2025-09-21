@@ -287,7 +287,7 @@ local function ParseExtrasFromTooltip(lines)
     slotName=nil, armorType=nil, armor=nil,
     attrs={ str=nil, agi=nil, sta=nil, int=nil, spi=nil,
             crit=nil, hit=nil, haste=nil, ap=nil, sp=nil, mp5=nil, def=nil, block=nil },
-    weapon={ min=nil, max=nil, speed=nil, swingSpeed=nil, dps=nil },
+    weapon={ min=nil, max=nil, speed=nil, dps=nil },
     shieldBlock=nil,
   }
   local function num(s) s = tostring(s or ""):gsub(",", ""); return tonumber(s) end
@@ -347,15 +347,8 @@ local function ParseExtrasFromTooltip(lines)
     if dmin and dmax then extras.weapon.min = extras.weapon.min or num(dmin); extras.weapon.max = extras.weapon.max or num(dmax) end
     local dps = l:match("([%d%.]+)%s+[Dd]amage per second")
     if dps then extras.weapon.dps = extras.weapon.dps or tonumber(dps) end
-    local spd = l:match("[Ss]peed%s*([%d%.,]+)")
-    if spd then
-      spd = spd:gsub(",", ".")
-      local swing = tonumber(spd)
-      if swing then
-        extras.weapon.speed = extras.weapon.speed or swing
-        extras.weapon.swingSpeed = extras.weapon.swingSpeed or swing
-      end
-    end
+    local spd = l:match("[Ss]peed%s*([%d%.]+)")
+    if spd then extras.weapon.speed = extras.weapon.speed or tonumber(spd) end
 
     if low:find("^requires") then table.insert(extras.requires, l) end
     if low:find("^use:") or low:find("^equip:") or low:find("^chance on hit:") then table.insert(extras.effects, l) end
