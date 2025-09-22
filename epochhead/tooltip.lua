@@ -43,9 +43,10 @@ end
 
 
 function EH.ParseTooltipExtras(link)
-  if not scanTip or not link or not scanTip.SetHyperlink then return nil end
+  if not scanTip or not link then return nil end
   scanTip:ClearLines()
-  scanTip:SetHyperlink(link)
+  local ok = EH.SetTooltipFromLink and EH.SetTooltipFromLink(scanTip, link)
+  if not ok then return nil end
   local extras = { bindType=nil, requires={}, effects={}, setBonuses={} }
   local function gtxt(i) local fs=_G["EpochHeadScanTipTextLeft"..i]; return fs and fs:GetText() or nil end
   for i=2, 20 do

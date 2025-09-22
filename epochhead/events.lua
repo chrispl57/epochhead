@@ -269,7 +269,7 @@ local function TooltipLinesFromLink(link)
   EnsureScanTip()
   if not ScanTip:GetOwner() then ScanTip:SetOwner(WorldFrame or UIParent, "ANCHOR_NONE") end
   ScanTip:ClearLines()
-  local ok = pcall(ScanTip.SetHyperlink, ScanTip, link)
+  local ok = EH.SetTooltipFromLink and EH.SetTooltipFromLink(ScanTip, link)
   if not ok then return lines end
   for i = 1, 30 do
     local fs = _G["EpochHeadScanTipTextLeft"..i]
@@ -1223,7 +1223,7 @@ local function OnLootOpened()
   local gatherIntent = false
   if containerRecent then gatherIntent = true end
   if nodeTitle and nodeTitle ~= "" and ClassifyFromTitle(nodeTitle) then gatherIntent = true end
-  if RecentGatherCast("Mining", 12) or RecentGatherCast("Herbalism", 12) or RecentGatherCast("Skinning", 12) then gatherIntent = true end
+  if RecentGatherCast("Mining", 12) or RecentGatherCast("Herbalism", 12) or RecentGatherCast("Skinning", 2.5) then gatherIntent = true end
 
   -- If no GUID and this does not look like gather, try corpse GUID fallback (restores corpse dedupe)
   if (not lootGUID) and (not gatherIntent) then

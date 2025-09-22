@@ -67,6 +67,34 @@ function EH.GetItemIDFromLink(link)
   return id and tonumber(id) or nil
 end
 
+-- Try to set a tooltip to an item link while ignoring enchants/gems.
+-- Returns true if either SetItemByID or SetHyperlink succeeded.
+function EH.SetTooltipFromLink(tip, link)
+  if not tip or not link then return false end
+
+  local itemId = EH.GetItemIDFromLink(link)
+  if itemId and tip.SetItemByID then
+    local ok = pcall(tip.SetItemByID, tip, itemId)
+    if ok then return true end
+  end
+
+  local sanitized = link
+  if itemId then
+    sanitized = "item:" .. tostring(itemId)
+  end
+
+  if tip.SetHyperlink then
+    local ok = pcall(tip.SetHyperlink, tip, sanitized)
+    if ok then return true end
+    if sanitized ~= link then
+      ok = pcall(tip.SetHyperlink, tip, link)
+      if ok then return true end
+    end
+  end
+
+  return false
+end
+
 function EH.InstanceCtx()
   if not GetInstanceInfo then return nil end
   local name, instType, difficultyIndex, difficultyName, maxPlayers, dynDiff, isDyn, mapID, lfgID = GetInstanceInfo()
