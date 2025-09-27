@@ -1,10 +1,10 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.34
+-- Version: 0.9.35
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.34"
+EH.VERSION   = "0.9.35"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -191,15 +191,32 @@ function EH.snapshotUnit(unit)
   }
 end
 
+local function AttachSourceLocation(src, gatherHint)
+  if not src then return end
+
+  if gatherHint then
+    if gatherHint.zone then src.zone = src.zone or gatherHint.zone end
+    if gatherHint.subzone then src.subzone = src.subzone or gatherHint.subzone end
+    if gatherHint.x ~= nil and src.x == nil then src.x = gatherHint.x end
+    if gatherHint.y ~= nil and src.y == nil then src.y = gatherHint.y end
+  end
+
+  if src.zone and src.subzone and src.x ~= nil and src.y ~= nil then return end
+
+  local z, s, x, y = EH.Pos()
+  src.zone    = src.zone    or z
+  src.subzone = src.subzone or s
+  if src.x == nil then src.x = x end
+  if src.y == nil then src.y = y end
+end
+
 local function MobSourceFromUnit(unit)
   if not UnitExists(unit) then return nil end
   local g = UnitGUID(unit); if not g then return nil end
   local mid = GetEntryIdFromGUID(g)
   local lvl = UnitLevelSafe(unit) or (EH.mobSnap[g] and EH.mobSnap[g].level) or nil
 
-  -- NEW: capture location
-  local z, s, x, y = EH.Pos()
-
+  -- NEW: capture location (helper ensures fallback)
   local src = {
     kind = "mob",
     id   = mid,
@@ -212,9 +229,8 @@ local function MobSourceFromUnit(unit)
     reaction       = UnitReaction and UnitReaction("player", unit) or nil,
     maxHp          = UnitHealthMax and UnitHealthMax(unit) or nil,
     maxMana        = UnitManaMax and UnitManaMax(unit) or nil,
-    -- NEW
-    zone = z, subzone = s, x = x, y = y,
   }
+  AttachSourceLocation(src)
   return src, (mid and tostring(mid) or nil), g
 end
 
@@ -1021,6 +1037,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
     end
 
     src  = { kind="gather", gatherKind=gatherKind, nodeId=nodeId, nodeName=nodeName, guid=g }
+    AttachSourceLocation(src, EH._currentGather)
     sKey = NodeSourceKey(nodeId, nodeName)
 
     -- Attach corpse meta to the source + propagate hint; keep node id/name unchanged
@@ -1044,6 +1061,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
       if not nodeName or nodeName == "" then nodeName = "Herbalism Node" end
     end
     src  = { kind="gather", gatherKind=gk, nodeId=EH._currentGather.nodeId, nodeName=nodeName, guid=g }
+    AttachSourceLocation(src, EH._currentGather)
     sKey = NodeSourceKey(EH._currentGather.nodeId, nodeName)
   end
 
@@ -1101,6 +1119,11 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
   if not bypassToken and lootTokenSeenRecently(_tok) then
     log("loot skipped (token cooldown) token="..tostring(_tok))
     return
+  end
+
+  if src then
+    local gatherHint = (src.kind == "gather") and EH._currentGather or nil
+    AttachSourceLocation(src, gatherHint)
   end
 
   local ev = {
@@ -1262,11 +1285,16 @@ local function OnLootOpened()
   -- If we have a title and no explicit bag container, prefill gather hint
   if (not EH._currentContainer) and nodeTitle and nodeTitle ~= "" then
     local nodeId = (lootKind == "GameObject") and lootEntry or nil
+    local z, s, x, y = EH.Pos()
     EH._currentGather = {
       gatherKind = ClassifyFromTitle(nodeTitle) or "Container",
       nodeName   = nodeTitle,
       nodeId     = nodeId,
       sourceKey  = NodeSourceKey(nodeId, nodeTitle),
+      zone       = z,
+      subzone    = s,
+      x          = x,
+      y          = y,
     }
   end
 
@@ -1317,11 +1345,16 @@ local function OnLootOpened()
       end
       inferredName = inferredName or (kind .. " Node")
 
+      local z, s, x, y = EH.Pos()
       EH._currentGather = {
         gatherKind = kind,
         nodeName   = inferredName,
         nodeId     = nil,
         sourceKey  = NodeSourceKey(nil, inferredName),
+        zone       = z,
+        subzone    = s,
+        x          = x,
+        y          = y,
       }
       log(("gather infer (by cast/items): %s -> node='%s' key=%s")
         :format(kind, tostring(inferredName or "?"), tostring(EH._currentGather.sourceKey)))
