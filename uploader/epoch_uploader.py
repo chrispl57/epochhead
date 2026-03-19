@@ -13,7 +13,7 @@ from tkinter import ttk, messagebox, filedialog
 # ------------------ FIXED SETTINGS ------------------
 APP_NAME           = "Epoch Uploader"
 APP_VERSION        = "1.3.0"
-SERVER             = "http://193.233.161.214:5001"
+SERVER             = "http://85.137.248.214:5001"
 TOKEN              = "devtoken"
 VAR_NAME           = "epochheadDB"
 AUTO_RENAME        = True
@@ -453,6 +453,7 @@ class App(tk.Tk):
         self.updated = None
         self.dropped = None
         self.duplicates = None
+        self.kept = None
         self.server_ok = None
 
         self.warn_banner_var = tk.StringVar(value="")
@@ -811,6 +812,7 @@ class App(tk.Tk):
         self.updated    = totals.get("updated") or result.get("updated")
         self.dropped    = result.get("dropped_by_realm") or result.get("dropped")
         self.duplicates = result.get("dropped_dupes") or result.get("dropped_duplicates") or result.get("duplicates")
+        self.kept       = result.get("kept")
 
         # Addon version warning
         warn = None
@@ -831,7 +833,20 @@ class App(tk.Tk):
         self._set_status_line()
 
         self._log(f"Upload -> {code}")
-        if body:
+        summary_bits = []
+        if self.created is not None:
+            summary_bits.append(f"{self.created} created")
+        if self.updated is not None:
+            summary_bits.append(f"{self.updated} updated")
+        if self.dropped is not None:
+            summary_bits.append(f"{self.dropped} dropped")
+        if self.duplicates is not None:
+            summary_bits.append(f"{self.duplicates} duplicates")
+        if self.kept is not None:
+            summary_bits.append(f"{self.kept} kept")
+        if summary_bits:
+            self._log(", ".join(summary_bits).capitalize())
+        elif body:
             try:
                 preview = (body[:600] + ("…" if len(body) > 600 else "")).replace("\n", " ").strip()
                 self._log(preview)
