@@ -1,57 +1,17 @@
 local ADDON_NAME, EH = ...
-EH.ADDON_NAME = "epochhead"
-EH.VERSION    = "0.8.2"
+EH.ADDON_NAME     = "epochhead"
+EH.VERSION        = "0.9.37"
+EH.SCHEMA_VERSION = 2
+EH.MAX_QUEUE      = 50000
 
 epochheadDB = epochheadDB or {}
 
-EH.ALLOWED_REALMS = { ["Kezan"]=true, ["Gurubashi"]=true }
--- === GUID anti-dupe (5 min) ===
-local ANTI_DUPE_WINDOW = 300  -- 5 minutes
-Epoch_DropsData = Epoch_DropsData or {}
-Epoch_DropsData.recentGuidHits = Epoch_DropsData.recentGuidHits or {}
-local __recentGuidHits = Epoch_DropsData.recentGuidHits
-
-local function shouldSkipGuid(guid)
-    if not guid or guid == "" then return false end
-    local now = time()
-    local last = __recentGuidHits[guid]
-    if last and (now - last) < ANTI_DUPE_WINDOW then
-        return true
-    end
-    __recentGuidHits[guid] = now
-    return false
-end
-
-local function collectLootGuids()
-    local seen = {}
-    local n = GetNumLootItems and GetNumLootItems() or 0
-    for slot = 1, n do
-        -- GetLootSourceInfo returns a vararg list: guid1, qty1, guid2, qty2, ...
-        local src = {GetLootSourceInfo(slot)}
-        for i = 1, #src, 2 do
-            local g = src[i]
-            if g then seen[g] = true end
-        end
-    end
-    -- Return as an array
-    local arr, i = {}, 1
-    for g,_ in pairs(seen) do
-        arr[i] = g
-        i = i + 1
-    end
-    return arr
-end
--- === /GUID anti-dupe ===
-
+-- Realm allow-list: keys normalized to lowercase.
+EH.ALLOWED_REALMS = { ["kezan"]=true, ["gurubashi"]=true }
 
 function EH.isRealmAllowed(r)
   if not r then return false end
-  if EH.ALLOWED_REALMS[r] then return true end
-  local rl = string.lower(r)
-  for k,_ in pairs(EH.ALLOWED_REALMS) do
-    if string.lower(k) == rl then return true end
-  end
-  return false
+  return EH.ALLOWED_REALMS[string.lower(tostring(r))] == true
 end
 
 function EH.now() return time() end
@@ -88,30 +48,41 @@ function EH.dprint(...)
   end
 end
 
-local function clamp()
-  local ev = epochheadDB.events
-  if #ev <= 30000 then return end
-  local cut = #ev - 30000
-  for i=1,cut do ev[i]=nil end
-  local out = {}
-  for i=1,#ev do if ev[i] then out[#out+1]=ev[i] end end
-  epochheadDB.events = out
+-- Opt-in gate. Default is opted IN (existing users keep collecting);
+-- `/eh optout` flips it off until re-enabled.
+function EH.isCollectionEnabled()
+  local st = epochheadDB and epochheadDB.state
+  if not st then return true end
+  if st.optedOut == true then return false end
+  return true
 end
 
+local function clamp()
+  local ev = epochheadDB.events
+  local max = EH.MAX_QUEUE
+  if #ev <= max then return end
+  -- Drop oldest in a single pass without O(n^2) table.remove.
+  local cut = #ev - max
+  local out = {}
+  for i = cut + 1, #ev do out[#out+1] = ev[i] end
+  epochheadDB.events = out
+end
+EH.clampQueue = clamp
+
 function EH.push(ev)
-  -- Ensure core tables are initialized before logging
-  epochheadDB.state = epochheadDB.state or {}
+  epochheadDB.state  = epochheadDB.state  or {}
   epochheadDB.events = epochheadDB.events or {}
+
+  if not EH.isCollectionEnabled() then
+    epochheadDB.state.droppedByOptOut = (epochheadDB.state.droppedByOptOut or 0) + 1
+    return
+  end
 
   ev.session = epochheadDB.state.sessionId
 
   if epochheadDB.meta and epochheadDB.meta.player then
     local p = epochheadDB.meta.player
-    -- keep level fresh in metadata only
-    if UnitLevel then
-      p.level = UnitLevel("player")
-    end
-    -- realm gate using metadata
+    if UnitLevel then p.level = UnitLevel("player") end
     if not EH.isRealmAllowed(p.realm) then
       epochheadDB.state.droppedByRealm = (epochheadDB.state.droppedByRealm or 0) + 1
       if epochheadDB.state.debug then
@@ -129,24 +100,33 @@ end
 function EH.init()
   if not epochheadDB.meta then
     local v, build, dateStr, toc = GetBuildInfo()
-    local pn, pr = UnitName("player")
+    local pn = UnitName("player")
     local className, class = UnitClass("player")
     local raceName, race = UnitRace("player")
     local faction = UnitFactionGroup("player")
     local realmName = GetRealmName()
     epochheadDB.meta = {
-      addon=EH.ADDON_NAME, version=EH.VERSION, clientVersion=v, clientBuild=build, interface=toc, created=EH.now(),
+      addon=EH.ADDON_NAME, version=EH.VERSION,
+      schemaVersion=EH.SCHEMA_VERSION,
+      clientVersion=v, clientBuild=build, interface=toc, created=EH.now(),
       player={ name=pn, realm=realmName, class=class, className=className, race=race, raceName=raceName, faction=faction },
       allowedRealms={"Kezan","Gurubashi"}, realmAllowed=EH.isRealmAllowed(realmName)
     }
+  else
+    -- Keep meta.schemaVersion up to date; future migrations can branch on old values.
+    epochheadDB.meta.schemaVersion = epochheadDB.meta.schemaVersion or EH.SCHEMA_VERSION
+    epochheadDB.meta.version = EH.VERSION
   end
   epochheadDB.events = epochheadDB.events or {}
-  epochheadDB.state  = epochheadDB.state  or {
-    debug=false, sessionStarted=EH.now(), sessionId=newSessionId(), eventsThisSession=0,
-    settings={ snapPrintCooldown=30, printMouseover=false }
-  }
-  if not epochheadDB.state.sessionId then epochheadDB.state.sessionId = newSessionId() end
-  epochheadDB.state.settings = epochheadDB.state.settings or { snapPrintCooldown=30, printMouseover=false }
+  epochheadDB.state  = epochheadDB.state  or {}
+  local st = epochheadDB.state
+  st.debug          = st.debug or false
+  st.sessionStarted = EH.now()
+  st.sessionId      = newSessionId()
+  st.eventsThisSession = 0
+  st.settings = st.settings or { snapPrintCooldown=30, printMouseover=false }
+  -- Persistent tooltip dedupe with per-item timestamps for TTL pruning.
+  epochheadDB.seenTooltips = epochheadDB.seenTooltips or {}
 end
 
 
@@ -157,14 +137,14 @@ EH.VER_PREFIX = "EHVER"
 EH._verLatest = EH.VERSION
 EH._verLatestFrom = nil
 EH._verNotified = false
+EH._verLastBroadcast = 0
 
 local function parseVer(v)
   if not v then return {0,0,0} end
   local a,b,c = tostring(v):match("^(%d+)%.(%d+)%.(%d+)$")
   if not a then
-    -- fallback: split on dots, take numeric
     local p = {}
-    for num in tostring(v):gmatch("(%%d+)") do p[#p+1] = tonumber(num,10) or 0 end
+    for num in tostring(v):gmatch("(%d+)") do p[#p+1] = tonumber(num,10) or 0 end
     a,b,c = p[1] or 0, p[2] or 0, p[3] or 0
   end
   return {tonumber(a) or 0, tonumber(b) or 0, tonumber(c) or 0}
@@ -192,14 +172,21 @@ local function canSend(channel)
   if channel == "RAID" then return UnitInRaid and UnitInRaid("player") end
   if channel == "PARTY" then
     if IsInGroup then return IsInGroup() end
-    -- 3.3.5 fallback
     for i=1,4 do if UnitExists("party"..i) then return true end end
     return false
   end
   return false
 end
 
-function EH.broadcastVersion()
+-- Minimum seconds between version broadcasts (anti-spam)
+local VER_BROADCAST_COOLDOWN = 60
+
+function EH.broadcastVersion(force)
+  local nowSec = EH.now()
+  if (not force) and (nowSec - (EH._verLastBroadcast or 0)) < VER_BROADCAST_COOLDOWN then
+    return
+  end
+  EH._verLastBroadcast = nowSec
   tryRegisterPrefix()
   local payload = "VER:"..tostring(EH.VERSION or "0.0.0")
   if canSend("GUILD") then SendAddonMessage(EH.VER_PREFIX, payload, "GUILD") end
@@ -216,7 +203,6 @@ function EH._onAddonMsg(prefix, message, channel, sender)
       EH._verLatest = their
       EH._verLatestFrom = sender
     end
-    -- If we're behind, notify once per session
     if EH.compareVersion(their, EH.VERSION) == 1 and not EH._verNotified then
       verMsg(("|cffff4444Your EpochHead is out of date|r (yours %s, latest %s from %s)."):format(tostring(EH.VERSION), tostring(their), tostring(sender or "?")))
       verMsg("Grab the latest build when you can.")
@@ -226,17 +212,16 @@ function EH._onAddonMsg(prefix, message, channel, sender)
   end
   if message == "VER?" then
     local me = "VER:"..tostring(EH.VERSION or "0.0.0")
-    -- reply privately to avoid spam
     if sender and sender ~= UnitName("player") then
       SendAddonMessage(EH.VER_PREFIX, me, "WHISPER", sender)
     end
   end
 end
 
--- Lightweight timer for post-login broadcast (no C_Timer in 3.3.5)
+-- Post-login broadcast once, throttled.
 do
   local vf = CreateFrame("Frame")
-  local t0, sent = 0, false
+  local t0, armed, sent = 0, false, false
   vf:RegisterEvent("PLAYER_LOGIN")
   vf:RegisterEvent("PLAYER_ENTERING_WORLD")
   vf:RegisterEvent("CHAT_MSG_ADDON")
@@ -244,13 +229,15 @@ do
     if event == "CHAT_MSG_ADDON" then
       EH._onAddonMsg(...)
     else
-      -- throttle to fire once shortly after entering world
-      if not sent then
-        t0 = GetTime() + 3
-        sent = true
+      if not armed then
+        armed = true
+        t0 = (GetTime and GetTime() or 0) + 3
         self:SetScript("OnUpdate", function(self, elapsed)
-          if GetTime() >= t0 then
-            EH.broadcastVersion()
+          if (GetTime and GetTime() or 0) >= t0 then
+            if not sent then
+              EH.broadcastVersion(true)
+              sent = true
+            end
             self:SetScript("OnUpdate", nil)
           end
         end)
@@ -259,19 +246,12 @@ do
   end)
 end
 
--- Optional: /eh ver
-if SlashCmdList and SlashCmdList["EPOCHHEAD"] then
-  local prev = SlashCmdList["EPOCHHEAD"]
-  SlashCmdList["EPOCHHEAD"] = function(msg)
-    msg = tostring(msg or ""):lower()
-    if msg == "ver" or msg == "version" then
-      local latest = EH._verLatest or EH.VERSION
-      verMsg(("Version: |cffcceeff%s|r (latest seen: |cffcceeff%s|r%s)")
-        :format(tostring(EH.VERSION), tostring(latest), EH._verLatestFrom and (" from "..EH._verLatestFrom) or ""))
-      EH.broadcastVersion()
-      return
-    end
-    prev(msg)
-  end
+-- Periodic GUID-dedupe prune (util.lua owns the table)
+do
+  local pf = CreateFrame("Frame")
+  pf:RegisterEvent("PLAYER_ENTERING_WORLD")
+  pf:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+  pf:SetScript("OnEvent", function()
+    if EH.pruneGuidHits then EH.pruneGuidHits(true) end
+  end)
 end
-

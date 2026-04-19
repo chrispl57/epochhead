@@ -1,10 +1,9 @@
 -- EpochHead events.lua — 3.3.5a-safe (UNIFIED)
--- Version: 0.9.35
 
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = "0.9.35"
+EH.VERSION   = EH.VERSION or "0.9.36"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -24,7 +23,7 @@ end
 ------------------------------------------------------------
 _G.epochheadDB = _G.epochheadDB or { events = {}, meta = {} }
 if type(_G.epochheadDB.events) ~= "table" then _G.epochheadDB.events = {} end
-local MAX_QUEUE = 50000
+local function MAX_QUEUE() return (EH and EH.MAX_QUEUE) or 50000 end
 
 ------------------------------------------------------------
 -- Time + misc
@@ -88,13 +87,29 @@ end
 ------------------------------------------------------------
 local function detect_push()
   return function(ev)
+    if EH.isCollectionEnabled and not EH.isCollectionEnabled() then
+      local st = _G.epochheadDB and _G.epochheadDB.state
+      if st then st.droppedByOptOut = (st.droppedByOptOut or 0) + 1 end
+      return
+    end
     _G.epochheadDB = _G.epochheadDB or { events = {}, meta = {} }
     _G.epochheadDB.events = _G.epochheadDB.events or {}
-    if #_G.epochheadDB.events >= MAX_QUEUE then
-      table.remove(_G.epochheadDB.events, 1)
-      chat(("queue full (%d); dropping oldest"):format(MAX_QUEUE))
+    local events = _G.epochheadDB.events
+    local max = MAX_QUEUE()
+    if #events >= max then
+      -- Drop oldest ~1% in one pass to avoid per-push O(n).
+      local drop = math.max(1, math.floor(max * 0.01))
+      local out = {}
+      for i = drop + 1, #events do out[#out+1] = events[i] end
+      out[#out+1] = ev
+      _G.epochheadDB.events = out
+      if EH._debug then
+        chat(("queue full (%d); dropped %d oldest"):format(max, drop))
+      end
+      log("queued " .. (ev.type or "?"))
+      return
     end
-    table.insert(_G.epochheadDB.events, ev)
+    table.insert(events, ev)
     log("queued " .. (ev.type or "?"))
   end
 end
@@ -784,9 +799,11 @@ local function OnCombatLogEvent(self, event, ...)
   if subevent == "PARTY_KILL" or subevent == "UNIT_DIED" then
     local mid = GetEntryIdFromGUID(dstGUID)
     if mid then
+      local _z, _s, _x, _y = EH.Pos()
       lastMob = {
         id = mid, guid = dstGUID, name = dstName or ("Mob "..mid),
         t = now(),
+        zone = _z, subzone = _s, x = _x, y = _y,
         level = (EH.mobSnap[dstGUID] and EH.mobSnap[dstGUID].level) or UnitLevelSafe("target"),
         classification = UnitClassification and UnitClassification("target") or nil,
         creatureType   = UnitCreatureType and UnitCreatureType("target") or nil,
@@ -824,7 +841,12 @@ end
 
 -- throttle spam for dead mouseover snapshots
 local lastMouseoverLogGUID, lastMouseoverLogTS = nil, 0
+local function PlayerIsAFK()
+  if UnitIsAFK and UnitIsAFK("player") then return true end
+  return false
+end
 local function OnUpdateMouseover()
+  if PlayerIsAFK() then return end
   if UnitExists("mouseover") and UnitIsDead("mouseover") then
     local g = UnitGUID("mouseover")
     if g then
@@ -1079,18 +1101,27 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
     lootKind  = "Creature"
   end
 
-  -- Recent kill fallback (as mob)
+  -- Recent kill fallback (as mob). Require same zone to avoid stale
+  -- attribution after a zone change / UI reload while lastMob was set.
   if (not src) and lastMob and (now() - lastMob.t) <= 12 then
-    src = {
-      kind="mob", id=lastMob.id, guid=lastMob.guid, name=lastMob.name,
-      level=lastMob.level, classification=lastMob.classification,
-      creatureType=lastMob.creatureType, creatureFamily=lastMob.creatureFamily,
-      reaction=lastMob.reaction, maxHp=lastMob.maxHp, maxMana=lastMob.maxMana,
-    }
-    sKey      = tostring(lastMob.id or lastMob.guid)
-    g         = lastMob.guid
-    hasSource = (g ~= nil)
-    lootKind  = "Creature"
+    local zNow = select(1, EH.Pos())
+    local zoneOk = (not lastMob.zone) or (lastMob.zone == zNow)
+    if zoneOk then
+      src = {
+        kind="mob", id=lastMob.id, guid=lastMob.guid, name=lastMob.name,
+        level=lastMob.level, classification=lastMob.classification,
+        creatureType=lastMob.creatureType, creatureFamily=lastMob.creatureFamily,
+        reaction=lastMob.reaction, maxHp=lastMob.maxHp, maxMana=lastMob.maxMana,
+        zone=lastMob.zone, subzone=lastMob.subzone, x=lastMob.x, y=lastMob.y,
+      }
+      sKey      = tostring(lastMob.id or lastMob.guid)
+      g         = lastMob.guid
+      hasSource = (g ~= nil)
+      lootKind  = "Creature"
+    else
+      log("lastMob stale (zone mismatch); ignoring")
+      lastMob = nil
+    end
   end
 
   -- Kill credit only for mobs (skip for pickpocket)
@@ -1383,6 +1414,8 @@ f:RegisterEvent("QUEST_ACCEPTED")
 f:RegisterEvent("QUEST_LOG_UPDATE")
 f:RegisterEvent("QUEST_COMPLETE")
 f:RegisterEvent("QUEST_TURNED_IN")
+f:RegisterEvent("PLAYER_LOGOUT")
+f:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 
 -- Basic quest tracking (unchanged behavior; lightweight)
 local function QuestIDFromLink(link) local id = tostring(link or ""):match("Hquest:(%d+)"); return id and tonumber(id) or nil end
@@ -1493,6 +1526,7 @@ f:SetScript("OnEvent", function(self, event, ...)
       local addonName = a1
       if addonName and tostring(addonName):lower():find("epochhead") then
         StampMeta()
+        if EH.init then pcall(EH.init) end
         HookContainerUse()
         if not EH._loadedPrinted then
           chat(("loaded v%s (session=%s)"):format(tostring(EH.VERSION), tostring(EH.session)))
@@ -1503,6 +1537,7 @@ f:SetScript("OnEvent", function(self, event, ...)
       HookContainerUse()
       if not EH._loadedPrinted then
         StampMeta()
+        if EH.init then pcall(EH.init) end
         chat(("loaded v%s (session=%s)"):format(tostring(EH.VERSION), tostring(EH.session)))
         EH._loadedPrinted = true
       end
@@ -1510,9 +1545,9 @@ f:SetScript("OnEvent", function(self, event, ...)
       OnCombatLogEvent(self, event, a1,a2,a3,a4,a5,a6,a7,a8,a9,a10)
     elseif event == "UPDATE_MOUSEOVER_UNIT" then
       OnUpdateMouseover()
-      if UnitExists("mouseover") then EH.snapshotUnit("mouseover") end
+      if (not PlayerIsAFK()) and UnitExists("mouseover") then EH.snapshotUnit("mouseover") end
     elseif event == "PLAYER_TARGET_CHANGED" then
-      if UnitExists("target") then EH.snapshotUnit("target") end
+      if (not PlayerIsAFK()) and UnitExists("target") then EH.snapshotUnit("target") end
     elseif event == "UNIT_LEVEL" then
       local unit = a1
       if unit and UnitExists(unit) then EH.snapshotUnit(unit) end
@@ -1532,6 +1567,23 @@ f:SetScript("OnEvent", function(self, event, ...)
       OnQuestComplete()
     elseif event == "QUEST_TURNED_IN" then
       OnQuestTurnedIn(a1,a2,a3)
+    elseif event == "ZONE_CHANGED_NEW_AREA" then
+      -- Prevent cross-zone mis-attribution of the last-kill fallback.
+      lastMob = nil
+      lastDeadMouseover = nil
+    elseif event == "PLAYER_LOGOUT" then
+      -- Finalize session so server-side sees a clean close.
+      local st = _G.epochheadDB and _G.epochheadDB.state
+      local sessionStarted = (st and st.sessionStarted) or nil
+      local duration = sessionStarted and (now() - sessionStarted) or nil
+      local evCount = (st and st.eventsThisSession) or nil
+      PUSH({
+        type = "session_end",
+        t = now(),
+        session = EH.session,
+        durationSec = duration,
+        eventsThisSession = evCount,
+      })
     end
   end)
   if not ok and err then oops(event, err) end
@@ -1552,10 +1604,29 @@ SlashCmdList["EPOCHHEAD"] = function(msg)
     EH._debug = false; chat("debug OFF")
   elseif msg == "debug" or msg == "toggle" then
     EH._debug = not EH._debug; chat("debug " .. (EH._debug and "ON" or "OFF"))
+  elseif msg == "optin" or msg == "opt-in" or msg == "on" then
+    _G.epochheadDB.state = _G.epochheadDB.state or {}
+    _G.epochheadDB.state.optedOut = false
+    chat("collection ENABLED (opted in)")
+  elseif msg == "optout" or msg == "opt-out" or msg == "off" then
+    _G.epochheadDB.state = _G.epochheadDB.state or {}
+    _G.epochheadDB.state.optedOut = true
+    chat("collection DISABLED (opted out)")
+  elseif msg == "clear" then
+    _G.epochheadDB.events = {}
+    chat("event queue cleared")
   elseif msg == "status" then
-    local q = _G.epochheadDB and _G.epochheadDB.events and #_G.epochheadDB.events or 0
-    chat(("status v%s | queued=%d | lastError=%s"):format(EH.VERSION, q, EH._lastError or "none"))
+    local q      = _G.epochheadDB and _G.epochheadDB.events and #_G.epochheadDB.events or 0
+    local optedOut = _G.epochheadDB and _G.epochheadDB.state and _G.epochheadDB.state.optedOut
+    local oor      = _G.epochheadDB and _G.epochheadDB.state and _G.epochheadDB.state.droppedByRealm or 0
+    local oop      = _G.epochheadDB and _G.epochheadDB.state and _G.epochheadDB.state.droppedByOptOut or 0
+    chat(("status v%s | queued=%d | collection=%s | droppedRealm=%d | droppedOptOut=%d | lastError=%s")
+      :format(EH.VERSION, q, optedOut and "OFF" or "ON", oor, oop, EH._lastError or "none"))
+  elseif msg == "help" or msg == "?" then
+    chat("commands: ping | debug on/off | optin | optout | clear | status | ver | config")
+  elseif msg == "config" or msg == "options" then
+    if EH.ShowOptions then EH.ShowOptions() else chat("options panel not loaded") end
   else
-    chat("commands: ping | debug on/off | debug | status")
+    chat("commands: ping | debug on/off | optin | optout | clear | status | ver | config")
   end
 end

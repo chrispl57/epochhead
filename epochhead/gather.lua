@@ -11,45 +11,6 @@ local function GetSkillRanks()
 end
 EH.GetSkillRanks = GetSkillRanks
 
--- === GUID anti-dupe (5 min) ===
-local ANTI_DUPE_WINDOW = 300  -- 5 minutes
-Epoch_DropsData = Epoch_DropsData or {}
-Epoch_DropsData.recentGuidHits = Epoch_DropsData.recentGuidHits or {}
-local __recentGuidHits = Epoch_DropsData.recentGuidHits
-
-local function shouldSkipGuid(guid)
-    if not guid or guid == "" then return false end
-    local now = time()
-    local last = __recentGuidHits[guid]
-    if last and (now - last) < ANTI_DUPE_WINDOW then
-        return true
-    end
-    __recentGuidHits[guid] = now
-    return false
-end
-
-local function collectLootGuids()
-    local seen = {}
-    local n = GetNumLootItems and GetNumLootItems() or 0
-    for slot = 1, n do
-        -- GetLootSourceInfo returns a vararg list: guid1, qty1, guid2, qty2, ...
-        local src = {GetLootSourceInfo(slot)}
-        for i = 1, #src, 2 do
-            local g = src[i]
-            if g then seen[g] = true end
-        end
-    end
-    -- Return as an array
-    local arr, i = {}, 1
-    for g,_ in pairs(seen) do
-        arr[i] = g
-        i = i + 1
-    end
-    return arr
-end
--- === /GUID anti-dupe ===
-
-
 function EH.GatherSkillFor(typeName)
   local skills = GetSkillRanks()
   if typeName == "herb" then return skills["Herbalism"] or skills["Herb Gathering"] or nil end

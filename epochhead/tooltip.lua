@@ -3,45 +3,6 @@ local ADDON_NAME, EH = ...
 local scanTip = CreateFrame and CreateFrame("GameTooltip","EpochHeadScanTip",nil,"GameTooltipTemplate") or nil
 if scanTip then scanTip:SetOwner(UIParent, "ANCHOR_NONE") end
 
--- === GUID anti-dupe (5 min) ===
-local ANTI_DUPE_WINDOW = 300  -- 5 minutes
-Epoch_DropsData = Epoch_DropsData or {}
-Epoch_DropsData.recentGuidHits = Epoch_DropsData.recentGuidHits or {}
-local __recentGuidHits = Epoch_DropsData.recentGuidHits
-
-local function shouldSkipGuid(guid)
-    if not guid or guid == "" then return false end
-    local now = time()
-    local last = __recentGuidHits[guid]
-    if last and (now - last) < ANTI_DUPE_WINDOW then
-        return true
-    end
-    __recentGuidHits[guid] = now
-    return false
-end
-
-local function collectLootGuids()
-    local seen = {}
-    local n = GetNumLootItems and GetNumLootItems() or 0
-    for slot = 1, n do
-        -- GetLootSourceInfo returns a vararg list: guid1, qty1, guid2, qty2, ...
-        local src = {GetLootSourceInfo(slot)}
-        for i = 1, #src, 2 do
-            local g = src[i]
-            if g then seen[g] = true end
-        end
-    end
-    -- Return as an array
-    local arr, i = {}, 1
-    for g,_ in pairs(seen) do
-        arr[i] = g
-        i = i + 1
-    end
-    return arr
-end
--- === /GUID anti-dupe ===
-
-
 function EH.ParseTooltipExtras(link)
   if not scanTip or not link then return nil end
   scanTip:ClearLines()
@@ -86,21 +47,55 @@ local function tooltipRecord()
     if txt and txt ~= "" then EH.lastTooltipTitle = txt end
   end
 end
--- Deduplicate tooltip logs per item ID for the current session
-local seenTooltipItems = {}
+-- Deduplicate tooltip logs per item ID across sessions, 7-day TTL.
+local TOOLTIP_TTL = 7 * 24 * 3600
+
+local function tooltipDB()
+  _G.epochheadDB = _G.epochheadDB or {}
+  _G.epochheadDB.seenTooltips = _G.epochheadDB.seenTooltips or {}
+  return _G.epochheadDB.seenTooltips
+end
+
+local function tooltipSeenRecently(iid)
+  if not iid then return false end
+  local db = tooltipDB()
+  local t  = db[iid]
+  if not t then return false end
+  local nowT = time()
+  if (nowT - t) > TOOLTIP_TTL then
+    db[iid] = nil
+    return false
+  end
+  return true
+end
+
+local function markTooltipSeen(iid)
+  if not iid then return end
+  tooltipDB()[iid] = time()
+end
 
 local function logItemTooltip(tip)
   local name, link = tip:GetItem()
   if not link or not EH or not EH.push then return end
   local entry = EH.BuildItemEntry and EH.BuildItemEntry(link, name, 1, nil) or { name = name }
   local iid = entry and entry.id
-  if iid and seenTooltipItems[iid] then return end
-  if iid then seenTooltipItems[iid] = true end
+  if tooltipSeenRecently(iid) then return end
+  markTooltipSeen(iid)
   EH.push({
     type = "item_info",
     t = EH.now and EH.now() or time(),
     item = entry,
   })
+end
+
+-- Prune expired tooltip dedupe entries on login.
+local function pruneTooltipDB()
+  local db = tooltipDB()
+  local nowT = time()
+  local cutoff = nowT - TOOLTIP_TTL
+  for iid, t in pairs(db) do
+    if type(t) ~= "number" or t < cutoff then db[iid] = nil end
+  end
 end
 
 if GameTooltip and GameTooltip.HookScript then
@@ -112,4 +107,10 @@ end
 
 if ItemRefTooltip and ItemRefTooltip.HookScript then
   ItemRefTooltip:HookScript("OnTooltipSetItem", logItemTooltip)
+end
+
+local ttf = CreateFrame and CreateFrame("Frame") or nil
+if ttf then
+  ttf:RegisterEvent("PLAYER_LOGIN")
+  ttf:SetScript("OnEvent", function() pruneTooltipDB() end)
 end

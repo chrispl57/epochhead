@@ -1,16 +1,22 @@
 ## Interface: 30300
 ## Title: epochhead
-## Notes: Collects world data (kills, loot, nodes, quests, vendors, etc.) for a Wowhead-like site.
+## Notes: Collects world data (kills, loot, nodes, quests, vendors, trainers, recipes, gossip, etc.).
 ## Author: _macetotheface_ -- Discord Contact
-## Version: 0.9.35
+## Version: 0.9.37
 ## SavedVariables: epochheadDB
 
-init.lua
 util.lua
+init.lua
 mobs.lua
 tooltip.lua
 keys.lua
 gather.lua
 services.lua
-quests.lua
 events.lua
+trainer.lua
+tradeskill.lua
+gossip.lua
+reputation.lua
+questobj.lua
+mobspells.lua
+ui.lua

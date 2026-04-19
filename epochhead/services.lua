@@ -17,25 +17,7 @@ local function now()
 end
 
 local function GetEntryIdFromGUID(guid)
-  if not guid then return nil end
-  local s = tostring(guid)
-  if s:find("-", 1, true) then
-    local parts = { strsplit("-", s) }
-    local id = tonumber(parts[6] or parts[5])
-    if id and id > 0 then return id end
-  end
-  local up = s:gsub("^0x", ""):upper()
-  if #up < 10 then return nil end
-  local high = up:sub(1, 4)
-  local idHex = up:sub(5, 10)
-  if high:sub(1, 2) == "F1" then
-    local id = tonumber(idHex, 16)
-    if id and id > 0 then return id end
-  end
-  local nB = tonumber(up:sub(5, 10), 16)
-  if nB and nB > 0 then return nB end
-  local nA = tonumber(up:sub(9, 14), 16)
-  if nA and nA > 0 then return nA end
+  if EH.GetEntryIdFromGUID then return EH.GetEntryIdFromGUID(guid) end
   return nil
 end
 
