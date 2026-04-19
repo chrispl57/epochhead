@@ -528,9 +528,11 @@ local function PushKillEventFromSource(src)
 
   local key = src.id and tostring(src.id) or (src.guid and tostring(src.guid)) or nil
   if not key then return end
+  local groupMembers = EH.GroupMemberGUIDs and EH.GroupMemberGUIDs() or nil
   PUSH({
     type = "kill", t = now(), session = EH.session,
     sourceKey = key, source = src, instance = GetInstanceInfoLite(),
+    groupMembers = groupMembers,
   })
   log("kill " .. key)
 end
@@ -1166,6 +1168,7 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
     items = items,
     money = moneyCopper and { copper = moneyCopper } or nil,
     instance = GetInstanceInfoLite(),
+    groupMembers = EH.GroupMemberGUIDs and EH.GroupMemberGUIDs() or nil,
   }
 
   -- Attach corpse info to the event (for correlation) without changing naming

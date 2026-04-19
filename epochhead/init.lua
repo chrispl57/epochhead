@@ -1,6 +1,6 @@
 local ADDON_NAME, EH = ...
 EH.ADDON_NAME     = "epochhead"
-EH.VERSION        = "0.9.37"
+EH.VERSION        = "0.9.38"
 EH.SCHEMA_VERSION = 2
 EH.MAX_QUEUE      = 50000
 

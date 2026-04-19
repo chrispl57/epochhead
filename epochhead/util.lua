@@ -142,6 +142,28 @@ function EH.GroupCtx()
   return { lootMethod = lootMethod, masterLooterParty = mlParty, masterLooterRaid = mlRaid, partySize = party, raidSize = raid }
 end
 
+-- Returns a flat list of group member GUIDs (excluding the player) for dedupe attribution.
+-- Returns nil if solo, to keep solo events lightweight.
+function EH.GroupMemberGUIDs()
+  local raid  = (GetNumRaidMembers and GetNumRaidMembers()) and GetNumRaidMembers() or 0
+  local party = (GetNumPartyMembers and GetNumPartyMembers()) and GetNumPartyMembers() or 0
+  if raid == 0 and party == 0 then return nil end
+  local guids = {}
+  if raid > 0 then
+    for i = 1, raid do
+      local g = UnitGUID and UnitGUID("raid"..i)
+      if g then guids[#guids+1] = g end
+    end
+  elseif party > 0 then
+    for i = 1, party do
+      local g = UnitGUID and UnitGUID("party"..i)
+      if g then guids[#guids+1] = g end
+    end
+  end
+  if #guids == 0 then return nil end
+  return guids
+end
+
 -- 3.3.5 map API; 5 decimal precision (~1.1 yd @ 100-yd zone)
 function EH.Pos()
   if SetMapToCurrentZone then SetMapToCurrentZone() end
