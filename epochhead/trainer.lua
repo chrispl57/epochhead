@@ -124,6 +124,7 @@ local function snapshotTrainer()
         reqLevel  = levelReq,
         reqAbility = abilityReq,
       }
+      if EH.NoteSpellId and spellId then EH.NoteSpellId(spellId, "trainer") end
     end
   end
 

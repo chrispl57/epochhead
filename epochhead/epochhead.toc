@@ -2,7 +2,7 @@
 ## Title: epochhead
 ## Notes: Collects world data (kills, loot, nodes, quests, vendors, trainers, recipes, gossip, etc.).
 ## Author: _macetotheface_ -- Discord Contact
-## Version: 0.9.38
+## Version: 0.9.40
 ## SavedVariables: epochheadDB
 
 util.lua
@@ -18,5 +18,6 @@ tradeskill.lua
 gossip.lua
 reputation.lua
 questobj.lua
+spells.lua
 mobspells.lua
 ui.lua

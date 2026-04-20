@@ -1,6 +1,6 @@
 local ADDON_NAME, EH = ...
 EH.ADDON_NAME     = "epochhead"
-EH.VERSION        = "0.9.38"
+EH.VERSION        = "0.9.39"
 EH.SCHEMA_VERSION = 2
 EH.MAX_QUEUE      = 50000
 
@@ -85,7 +85,7 @@ function EH.push(ev)
     if UnitLevel then p.level = UnitLevel("player") end
     if not EH.isRealmAllowed(p.realm) then
       epochheadDB.state.droppedByRealm = (epochheadDB.state.droppedByRealm or 0) + 1
-      if epochheadDB.state.debug then
+      if EH._debug then
         DEFAULT_CHAT_FRAME:AddMessage("|cff99ccff[epochhead]|r drop (realm not allowed): "..tostring(p.realm or "?"))
       end
       return

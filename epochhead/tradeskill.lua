@@ -75,17 +75,19 @@ local function scanTradeSkill()
         }
       end
 
+      local recipeSpellId = extractSpellId(recipeLink)
       recipes[#recipes + 1] = {
         index      = i,
         name       = name,
         difficulty = difficulty,
         resultItemId = extractItemId(link),
         resultLink = link,
-        spellId    = extractSpellId(recipeLink),
+        spellId    = recipeSpellId,
         minMade    = minMade,
         maxMade    = maxMade,
         reagents   = reagents,
       }
+      if EH.NoteSpellId and recipeSpellId then EH.NoteSpellId(recipeSpellId, "recipe") end
     end
   end
 
@@ -142,15 +144,17 @@ local function scanCraft()
           count  = rNeeded,
         }
       end
+      local craftSpellId = extractSpellId(link)
       recipes[#recipes + 1] = {
         index    = i,
         name     = name,
         subRank  = subSpellName, -- e.g., "Apprentice", or rune rank
         difficulty = typ,
-        spellId  = extractSpellId(link),
+        spellId  = craftSpellId,
         resultLink = link,
         reagents = reagents,
       }
+      if EH.NoteSpellId and craftSpellId then EH.NoteSpellId(craftSpellId, "craft") end
     end
   end
 

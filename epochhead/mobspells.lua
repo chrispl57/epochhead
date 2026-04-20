@@ -59,7 +59,7 @@ local function maybePrune()
   end
 end
 
-local function onCLEU(_, subevent, sourceGUID, sourceName, sourceFlags, destGUID, destName, destFlags, spellId, spellName, spellSchool, auraType)
+local function onCLEU(_, subevent, _hideCaster, sourceGUID, sourceName, sourceFlags, _srcRaidFlags, destGUID, destName, destFlags, _dstRaidFlags, spellId, spellName, spellSchool, auraType)
   if not TRACKED[subevent] then return end
   if not sourceGUID then return end
 
@@ -81,6 +81,8 @@ local function onCLEU(_, subevent, sourceGUID, sourceName, sourceFlags, destGUID
   if seen[key] and (n - seen[key]) < TTL then return end
   seen[key] = n
   maybePrune()
+
+  if EH.NoteSpellId then EH.NoteSpellId(spellId, "mob_cast") end
 
   local src = {
     kind = "mob",

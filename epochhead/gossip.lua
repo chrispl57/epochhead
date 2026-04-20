@@ -101,11 +101,14 @@ local function onGossipShow()
   if #options == 0 and #available == 0 and #active == 0 then return end
   if key then gossipDedupe[key] = now() end
 
+  local greetingText = GetGossipText and GetGossipText() or nil
+
   local ev = {
     type = "gossip_snapshot",
     t = now(),
     source = src,
     sourceKey = src.id and ("npc:" .. tostring(src.id)) or nil,
+    greetingText = greetingText,
     options = options,
     availableQuests = available,
     activeQuests = active,

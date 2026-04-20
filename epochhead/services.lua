@@ -76,6 +76,18 @@ local function CollectVendorItems()
       entry.qtyPerPurchase = quantity
       entry.numAvailable = numAvailable
       entry.extendedCost = extendedCost
+      if extendedCost and GetMerchantItemCostInfo and GetMerchantItemCostItem then
+        local numCost = GetMerchantItemCostInfo(index)
+        if numCost and numCost > 0 then
+          local costs = {}
+          for ci = 1, numCost do
+            local cLink, cQty, cTexture = GetMerchantItemCostItem(index, ci)
+            local cId = cLink and tonumber(tostring(cLink):match("item:(%d+)")) or nil
+            costs[#costs + 1] = { itemId = cId, link = cLink, quantity = cQty, texture = cTexture }
+          end
+          if #costs > 0 then entry.currencyCost = costs end
+        end
+      end
       items[#items + 1] = entry
       if not seen[iid] then
         seen[iid] = true
