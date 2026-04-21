@@ -3,7 +3,7 @@
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = EH.VERSION or "0.9.41"
+EH.VERSION   = EH.VERSION or "0.9.42"
 
 ------------------------------------------------------------
 -- Logging helpers
