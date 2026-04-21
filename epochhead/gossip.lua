@@ -92,9 +92,11 @@ local function onGossipShow()
     -- 3.3.5: (title, level, trivial, isComplete)  stride=4
     local rows = pairsToRows(raw, 4)
     for _, r in ipairs(rows) do
-      active[#active + 1] = {
-        title = r[1], level = r[2], trivial = r[3], isComplete = r[4],
-      }
+      if not r[4] then
+        active[#active + 1] = {
+          title = r[1], level = r[2], trivial = r[3], isComplete = r[4],
+        }
+      end
     end
   end
 

@@ -3,7 +3,7 @@
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = EH.VERSION or "0.9.36"
+EH.VERSION   = EH.VERSION or "0.9.41"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -670,6 +670,18 @@ if not EH.OnSpellcastSucceeded then
     if (type(spellID) == "number" and SKINNING_SPELL_IDS[spellID]) or isSkinningName(spell) then
       MarkGatherCast("Skinning"); log("gather cast: Skinning"); return
     end
+
+    -- World object interaction (right-click forage nodes, cacti, berries, etc.)
+    -- "Opening" fires when the player interacts with a world game object.
+    -- Use the tooltip captured BEFORE the click (HookWorldObjectTooltip) so that
+    -- whatever is moused over at spell-fire time doesn't pollute the source name.
+    if spell and tostring(spell):lower():find("^opening") then
+      local wo   = EH._lastWorldObjectTooltip
+      local name = (wo and (now() - (wo.t or 0)) <= 5) and wo.name or nil
+      EH._lastWorldOpen = { ts = now(), name = name }
+      log(("world object interaction (Opening): name=%s"):format(tostring(name or "?")))
+      return
+    end
   end
 end
 
@@ -765,8 +777,43 @@ local function HookContainerUse()
 end
 
 ------------------------------------------------------------
--- Combat log + mouseover
+-- World-object tooltip tracking
+-- SetOwner fires every time a new world object is hovered (even if the tooltip
+-- was already visible). We schedule a one-frame OnUpdate read so the text is
+-- fully populated before we capture it.
 ------------------------------------------------------------
+local function HookWorldObjectTooltip()
+  if not GameTooltip or not CreateFrame then return end
+
+  local ttReadFrame = CreateFrame("Frame")
+  ttReadFrame:Hide()
+  ttReadFrame:SetScript("OnUpdate", function(self)
+    self:Hide()
+    if not GameTooltip:IsShown() then return end
+    -- Skip unit tooltips (creature, player, NPC)
+    if type(GameTooltip.GetUnit) == "function" then
+      local unit = GameTooltip:GetUnit()
+      if unit and UnitExists and UnitExists(unit) then return end
+    end
+    local fs = _G["GameTooltipTextLeft1"]
+    local name = fs and type(fs.GetText) == "function" and fs:GetText() or nil
+    if name and name ~= "" then
+      EH._lastWorldObjectTooltip = { name = name, t = now() }
+      log("world object tooltip: " .. name)
+    end
+  end)
+
+  -- SetOwner fires reliably on every new hover target, including re-hovers
+  if type(GameTooltip.SetOwner) == "function" then
+    hooksecurefunc(GameTooltip, "SetOwner", function(self, owner)
+      if owner == WorldFrame then
+        ttReadFrame:Show()  -- read text next frame, after content is populated
+      end
+    end)
+  end
+end
+
+
 local function ReadCLEU(...)
   if CombatLogGetCurrentEventInfo then
     local _, subevent, _, srcGUID, srcName, _, _, dstGUID, dstName, _, _ = CombatLogGetCurrentEventInfo()
@@ -1083,6 +1130,10 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
       local derived = HerbNameFromItems(items)
       if derived then nodeName = derived end
       if not nodeName or nodeName == "" then nodeName = "Herbalism Node" end
+    elseif (not nodeName or nodeName == "" or nodeName == "World Object") and #items == 1 then
+      -- Last resort for forage nodes: use the single dropped item's name (e.g. "Cactus Apple")
+      local iname = items[1] and ((items[1].info and items[1].info.name) or items[1].name) or nil
+      if iname and iname ~= "" then nodeName = iname end
     end
     src  = { kind="gather", gatherKind=gk, nodeId=EH._currentGather.nodeId, nodeName=nodeName, guid=g }
     AttachSourceLocation(src, EH._currentGather)
@@ -1279,8 +1330,9 @@ local function OnLootOpened()
   -- quick intent guess before we consider corpse GUID fallbacks
   local gatherIntent = false
   if containerRecent then gatherIntent = true end
-  if nodeTitle and nodeTitle ~= "" and ClassifyFromTitle(nodeTitle) then gatherIntent = true end
+  if nodeTitle and nodeTitle ~= "" and (ClassifyFromTitle(nodeTitle) or lootKind ~= "Creature") then gatherIntent = true end
   if RecentGatherCast("Mining", 12) or RecentGatherCast("Herbalism", 12) or RecentGatherCast("Skinning", 2.5) then gatherIntent = true end
+  if EH._lastWorldOpen and ((now() - (EH._lastWorldOpen.ts or 0)) <= 5) then gatherIntent = true end
 
   -- If no GUID and this does not look like gather, try corpse GUID fallback (restores corpse dedupe)
   if (not lootGUID) and (not gatherIntent) then
@@ -1316,6 +1368,30 @@ local function OnLootOpened()
     end
   end
 
+  -- World object fallback: "Opening" spell + no detectable GUID (forage nodes, cacti, etc.)
+  -- These are world GameObjects that GetLootSourceInfo() doesn't report a GUID for.
+  -- Use name/id captured from UnitGUID("target") at spell-cast time (before target clears).
+  if (not EH._currentContainer) and (not lootGUID)
+     and EH._lastWorldOpen and ((now() - (EH._lastWorldOpen.ts or 0)) <= 5) then
+    local z, s, x, y = EH.Pos()
+    local wo = EH._lastWorldOpen
+    local nm  = wo.name or (nodeTitle and nodeTitle ~= "" and nodeTitle) or "World Object"
+    local nid = wo.id
+    local gk  = (nodeTitle and nodeTitle ~= "" and ClassifyFromTitle(nodeTitle)) or "Container"
+    EH._currentGather = {
+      gatherKind = gk,
+      nodeName   = nm,
+      nodeId     = nid,
+      guid       = wo.guid,
+      sourceKey  = NodeSourceKey(nid, nm),
+      zone       = z,
+      subzone    = s,
+      x          = x,
+      y          = y,
+    }
+    log(("world object fallback (Opening): kind=%s name=%s id=%s"):format(gk, nm, tostring(nid or "?")))
+  end
+
   -- If we have a title and no explicit bag container, prefill gather hint
   if (not EH._currentContainer) and nodeTitle and nodeTitle ~= "" then
     local nodeId = (lootKind == "GameObject") and lootEntry or nil
@@ -1338,7 +1414,7 @@ local function OnLootOpened()
     local link = (GetLootSlotLink and GetLootSlotLink(slot)) or nil
     if link and tostring(link):find("item:") then
       local _, name, qty, quality = GetLootSlotInfo(slot)
-      if not IsProbablyMobName(name) then
+      if gatherIntent or not IsProbablyMobName(name) then
         local entry = EH.BuildItemEntry(link, name, qty, quality)
         if entry and entry.id then table.insert(items, entry) end
       end
@@ -1531,6 +1607,7 @@ f:SetScript("OnEvent", function(self, event, ...)
         StampMeta()
         if EH.init then pcall(EH.init) end
         HookContainerUse()
+        HookWorldObjectTooltip()
         if not EH._loadedPrinted then
           chat(("loaded v%s (session=%s)"):format(tostring(EH.VERSION), tostring(EH.session)))
           EH._loadedPrinted = true
@@ -1538,6 +1615,7 @@ f:SetScript("OnEvent", function(self, event, ...)
       end
     elseif event == "PLAYER_LOGIN" then
       HookContainerUse()
+      HookWorldObjectTooltip()
       if not EH._loadedPrinted then
         StampMeta()
         if EH.init then pcall(EH.init) end
@@ -1560,6 +1638,8 @@ f:SetScript("OnEvent", function(self, event, ...)
       EH._currentGather = nil
       EH._currentContainer = nil
       EH._pendingBagOpen = nil
+      EH._lastWorldOpen = nil
+      EH._lastWorldObjectTooltip = nil
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
       EH.OnSpellcastSucceeded(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10)
     elseif event == "QUEST_ACCEPTED" then

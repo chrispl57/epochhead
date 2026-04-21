@@ -96,6 +96,12 @@ function EH.NoteSpellId(spellId, sourceHint)
   -- emit a skeleton so the server learns the id existed in the wild.
   sent[id] = true
 
+  local cooldown = nil
+  if GetSpellBaseCooldown then
+    local ok2, cd = pcall(GetSpellBaseCooldown, id)
+    if ok2 and cd and cd > 0 then cooldown = cd end
+  end
+
   local playerLevel = UnitLevel and UnitLevel("player") or nil
   local tooltip = scrapeTooltip(id)
 
@@ -109,6 +115,7 @@ function EH.NoteSpellId(spellId, sourceHint)
     castTime = castTime,
     minRange = minRange,
     maxRange = maxRange,
+    cooldown = cooldown,
     tooltip = tooltip,
     observer = {
       level = playerLevel,

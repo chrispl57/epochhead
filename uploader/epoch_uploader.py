@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox, filedialog
 
 # ------------------ FIXED SETTINGS ------------------
 APP_NAME           = "Epoch Uploader"
-APP_VERSION        = "1.3.0"
+APP_VERSION        = "1.3.3"
 SERVER             = "http://85.137.248.214:5001"
 TOKEN              = "devtoken"
 VAR_NAME           = "epochheadDB"
