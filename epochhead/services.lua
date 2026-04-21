@@ -57,6 +57,7 @@ local function CollectVendorItems()
   if not count or count <= 0 then return nil end
 
   local items, uniqueIds, seen = {}, {}, {}
+  local MAX_COST_ENTRIES = 16
   for index = 1, count do
     local link = GetMerchantItemLink and GetMerchantItemLink(index) or nil
     local name, _, price, quantity, numAvailable, _, extendedCost = GetMerchantItemInfo(index)
@@ -79,11 +80,17 @@ local function CollectVendorItems()
       if extendedCost and GetMerchantItemCostInfo and GetMerchantItemCostItem then
         local numCost = GetMerchantItemCostInfo(index)
         if numCost and numCost > 0 then
+          if numCost > MAX_COST_ENTRIES then
+            numCost = MAX_COST_ENTRIES
+          end
           local costs = {}
           for ci = 1, numCost do
             local cLink, cQty, cTexture = GetMerchantItemCostItem(index, ci)
             local cId = cLink and tonumber(tostring(cLink):match("item:(%d+)")) or nil
-            costs[#costs + 1] = { itemId = cId, link = cLink, quantity = cQty, texture = cTexture }
+            cQty = tonumber(cQty) or 0
+            if cQty > 0 then
+              costs[#costs + 1] = { itemId = cId, link = cLink, quantity = cQty, texture = cTexture }
+            end
           end
           if #costs > 0 then entry.currencyCost = costs end
         end
@@ -175,4 +182,3 @@ SLASH_EPOCHHEAD_VENDOR1 = "/ehvendor"
 SlashCmdList["EPOCHHEAD_VENDOR"] = function()
   EH.captureVendor("MANUAL")
 end
-
