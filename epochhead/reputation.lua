@@ -136,6 +136,7 @@ local function onQuestTurnedIn(questID)
     end
   end
   EH.NoteRepSource({ kind = "quest", id = questID, name = title })
+  chat(("rep source quest turn-in: id=%s"):format(tostring(questID)))
 end
 
 local f = CreateFrame and CreateFrame("Frame") or nil
