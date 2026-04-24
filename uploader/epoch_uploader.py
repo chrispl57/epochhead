@@ -6,13 +6,20 @@
 # - Exponential backoff + min-interval between uploads
 # - Single instance (best-effort), no external deps
 
-import os, sys, json, time, threading, queue, re, socket, logging, logging.handlers
+import os, sys, json, time, threading, queue, re, socket, logging, logging.handlers, glob
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:
+    pystray = None
+    Image = None
+
 # ------------------ FIXED SETTINGS ------------------
 APP_NAME           = "Epoch Uploader"
-APP_VERSION        = "1.3.3"
+APP_VERSION        = "1.4.0"
 SERVER             = "http://85.137.248.214:5001"
 TOKEN              = "devtoken"
 VAR_NAME           = "epochheadDB"
@@ -23,6 +30,8 @@ RETRY_ON_PARSE_SEC = 1.25
 UPLOAD_ENDPOINT    = "/upload"
 LOG_MAX_LINES      = 500
 MIN_SUCCESS_SPACING= 5.0  # seconds between successful uploads
+PRIMARY_SV_FILE    = "epochhead.lua"
+TARGET_SV_FILES    = ("aux-addon.lua", "epochhead.lua", "Auctionator.lua")
 
 # Single-instance (best effort) + activation ping
 MUTEX_NAME   = r"Global\EpochUploaderMutex_v2"
@@ -37,6 +46,9 @@ LOG_PATH    = os.path.join(APPDATA_DIR, "uploader.log")
 DEFAULT_AUTO_UPLOAD      = True
 DEFAULT_START_WITH_WIN   = False
 DEFAULT_PAUSE_WATCHING   = False
+DEFAULT_START_MINIMIZED  = False
+DEFAULT_START_SILENT     = False
+DEFAULT_CLEANUP_KEEP_FILES = 30
 
 # --------------- Logging (rotating) ---------------
 def _ensure_appdata():
@@ -428,7 +440,7 @@ class App(tk.Tk):
         self._debounce_until = 0.0
         self._watcher_running = True
         self._watcher_paused = False
-        self._last_sig = None  # (mtime_ns, size)
+        self._last_sig = None  # tuple of watched file signatures
         self._last_success_at = 0.0
         self._last_upload_ts = None
         self._uploading = False
@@ -448,6 +460,14 @@ class App(tk.Tk):
         self.auto_upload = bool(cfg.get("auto_upload", DEFAULT_AUTO_UPLOAD))
         self.start_with_windows = bool(cfg.get("autostart", DEFAULT_START_WITH_WIN))
         self.pause_watching = bool(cfg.get("pause_watching", DEFAULT_PAUSE_WATCHING))
+        self.start_minimized = bool(cfg.get("start_minimized", DEFAULT_START_MINIMIZED))
+        self.start_silent = bool(cfg.get("start_silent", DEFAULT_START_SILENT))
+        self.cleanup_keep_files = int(cfg.get("cleanup_keep_files", DEFAULT_CLEANUP_KEEP_FILES) or DEFAULT_CLEANUP_KEEP_FILES)
+
+        # CLI override for silent/minimized startup (useful from task scheduler).
+        if "--silent" in [a.lower() for a in sys.argv[1:]]:
+            self.start_minimized = True
+            self.start_silent = True
 
         self.created = None
         self.updated = None
@@ -459,6 +479,8 @@ class App(tk.Tk):
         self.warn_banner_var = tk.StringVar(value="")
         self.status_line_var = tk.StringVar(value="Idle")
         self.meta_player_var = tk.StringVar(value="")
+        self._tray_icon = None
+        self._tray_warned = False
 
         self._build_ui()
 
@@ -469,10 +491,14 @@ class App(tk.Tk):
         self.after(200, self._pump_queue)
         threading.Thread(target=self._watch_loop, daemon=True).start()
         _start_activation_listener(lambda: self.queue.put(("show", {})))
+        self._ensure_tray_icon()
+
+        if self.start_minimized:
+            self.after(50, self.withdraw)
 
         if self.sv_dir:
             self._log(f"Watching folder: {self.sv_dir}")
-            self._log("Target file: epochhead.lua")
+            self._log_target_files()
         else:
             self._log("Select your SavedVariables folder (e.g. GAMEDIR\\WTF\\Account\\ACCOUNTNAME\\SavedVariables).")
 
@@ -504,16 +530,23 @@ class App(tk.Tk):
         self.auto_upload_var = tk.BooleanVar(value=self.auto_upload)
         self.autostart_var   = tk.BooleanVar(value=self.start_with_windows)
         self.pause_var       = tk.BooleanVar(value=self.pause_watching)
+        self.minimized_var   = tk.BooleanVar(value=self.start_minimized)
+        self.silent_var      = tk.BooleanVar(value=self.start_silent)
 
         ttk.Checkbutton(bar, text="Auto-upload", variable=self.auto_upload_var,
                         command=self._toggle_auto).pack(side="left", padx=(10,0))
         ttk.Checkbutton(bar, text="Start with Windows", variable=self.autostart_var,
                         command=self._toggle_autostart).pack(side="left", padx=(10,0))
+        ttk.Checkbutton(bar, text="Start minimized", variable=self.minimized_var,
+                        command=self._toggle_start_minimized).pack(side="left", padx=(10,0))
+        ttk.Checkbutton(bar, text="Start silently", variable=self.silent_var,
+                        command=self._toggle_start_silent).pack(side="left", padx=(10,0))
         ttk.Checkbutton(bar, text="Pause watching", variable=self.pause_var,
                         command=self._toggle_pause).pack(side="left", padx=(10,0))
 
         ttk.Button(bar, text="Open SV Folder", command=self._open_sv_folder).pack(side="left", padx=(10,0))
         ttk.Button(bar, text="Open Log", command=self._open_log).pack(side="left", padx=(10,0))
+        ttk.Button(bar, text="Clean old uploads", command=self._cleanup_old_uploads).pack(side="left", padx=(10,0))
 
         # Status strip
         meta = ttk.Frame(root); meta.pack(fill="x", pady=(4, 8))
@@ -528,7 +561,7 @@ class App(tk.Tk):
         self.log.configure(state="disabled")
 
         # Footer
-        ttk.Label(root, text=f"Close window to keep uploader running in the background (single-instance).  v{APP_VERSION}",
+        ttk.Label(root, text=f"Close window to minimize to tray (single-instance).  v{APP_VERSION}",
                   foreground="#888").pack(anchor="w", pady=(8, 0))
 
         try: self.tk.call("tk", "scaling", 1.15)
@@ -566,15 +599,56 @@ class App(tk.Tk):
             pass
         self.log.see("end"); self.log.configure(state="disabled")
 
-    # ---------------- Events/queue ----------------
-    def _on_close_hide(self):
-        # Keep app running background (no tray in this build).
+    def _make_tray_image(self):
+        if Image is None:
+            return None
+        img = Image.new("RGBA", (64, 64), (35, 35, 35, 255))
+        d = ImageDraw.Draw(img)
+        d.ellipse((8, 8, 56, 56), fill=(43, 121, 245, 255))
+        d.text((19, 21), "EH", fill=(255, 255, 255, 255))
+        return img
+
+    def _ensure_tray_icon(self):
+        if self._tray_icon is not None or pystray is None:
+            if pystray is None and not self._tray_warned:
+                self._log("Tray support unavailable (missing pystray/Pillow in build environment).")
+                self._tray_warned = True
+            return
         try:
-            messagebox.showinfo(APP_NAME,
-                "Uploader will keep running in the background.\nRun it again to bring this window back, or use Task Manager to close.")
+            menu = pystray.Menu(
+                pystray.MenuItem("Restore", lambda: self.queue.put(("show", {}))),
+                pystray.MenuItem("Close", lambda: self.queue.put(("exit", {}))),
+            )
+            self._tray_icon = pystray.Icon("epoch_uploader", self._make_tray_image(), APP_NAME, menu)
+            self._tray_icon.run_detached()
+        except Exception as e:
+            self._tray_icon = None
+            self._log(f"Tray icon failed to start: {e}")
+
+    def _stop_tray_icon(self):
+        if not self._tray_icon:
+            return
+        try:
+            self._tray_icon.stop()
         except Exception:
             pass
+        self._tray_icon = None
+
+    # ---------------- Events/queue ----------------
+    def _on_close_hide(self):
+        # Keep app running background and show tray icon.
+        self._ensure_tray_icon()
+        if not self.start_silent:
+            try:
+                messagebox.showinfo(APP_NAME, "Uploader is still running in the system tray.")
+            except Exception:
+                pass
         self.withdraw()
+
+    def _exit_app(self):
+        self._watcher_running = False
+        self._stop_tray_icon()
+        self.destroy()
 
     def _pump_queue(self):
         try:
@@ -592,6 +666,9 @@ class App(tk.Tk):
                     self.deiconify()
                     try: self.lift(); self.focus_force()
                     except Exception: pass
+                elif kind == "exit":
+                    self._exit_app()
+                    return
         except queue.Empty:
             pass
         self.after(200, self._pump_queue)
@@ -616,6 +693,16 @@ class App(tk.Tk):
         cfg = load_config(); cfg["pause_watching"] = self.pause_watching; save_config(cfg)
         self._log(f"Watching {'paused' if self.pause_watching else 'resumed'}.")
 
+    def _toggle_start_minimized(self):
+        self.start_minimized = bool(self.minimized_var.get())
+        cfg = load_config(); cfg["start_minimized"] = self.start_minimized; save_config(cfg)
+        self._log(f"Start minimized {'enabled' if self.start_minimized else 'disabled'}.")
+
+    def _toggle_start_silent(self):
+        self.start_silent = bool(self.silent_var.get())
+        cfg = load_config(); cfg["start_silent"] = self.start_silent; save_config(cfg)
+        self._log(f"Start silently {'enabled' if self.start_silent else 'disabled'}.")
+
     def _open_sv_folder(self):
         try:
             if self._valid_dir(self.sv_dir):
@@ -634,11 +721,57 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"Open log failed: {e}")
 
+    def _cleanup_old_uploads(self):
+        if not self._valid_dir(self.sv_dir):
+            self._log("Select your SavedVariables folder first.")
+            return
+        keep = max(1, int(self.cleanup_keep_files or DEFAULT_CLEANUP_KEEP_FILES))
+        pattern = os.path.join(self.sv_dir, "epochhead_upload*.lua")
+        files = sorted(glob.glob(pattern), key=lambda p: os.path.getmtime(p), reverse=True)
+        old = files[keep:]
+        if not old:
+            self._log(f"Cleanup complete. Nothing to remove (keeping up to {keep} files).")
+            return
+        removed = 0
+        for p in old:
+            try:
+                os.remove(p)
+                removed += 1
+            except Exception as e:
+                self._log(f"Failed to remove {os.path.basename(p)}: {e}")
+        self._log(f"Cleanup removed {removed} old uploaded files (kept newest {keep}).")
+
     # ---------------- Paths ----------------
     def _valid_dir(self, d): return bool(d) and os.path.isdir(d)
 
     def _sv_file_path(self):
-        return os.path.join(self.sv_dir, "epochhead.lua") if self._valid_dir(self.sv_dir) else None
+        return os.path.join(self.sv_dir, PRIMARY_SV_FILE) if self._valid_dir(self.sv_dir) else None
+
+    def _log_target_files(self):
+        self._log("Target files: " + ", ".join(TARGET_SV_FILES))
+
+    def _watched_file_signatures(self):
+        if not self._valid_dir(self.sv_dir):
+            return tuple()
+        by_lower = {}
+        try:
+            for name in os.listdir(self.sv_dir):
+                by_lower[name.lower()] = name
+        except Exception:
+            return tuple()
+        sigs = []
+        for target in TARGET_SV_FILES:
+            real = by_lower.get(target.lower())
+            if not real:
+                continue
+            p = os.path.join(self.sv_dir, real)
+            try:
+                st = os.stat(p)
+                sigs.append((target.lower(), getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size))
+            except FileNotFoundError:
+                continue
+        sigs.sort(key=lambda x: x[0])
+        return tuple(sigs)
 
     def _choose_sv_dir(self, initial=False):
         start_dir = os.path.join(os.path.expanduser("~"), "Documents")
@@ -653,34 +786,66 @@ class App(tk.Tk):
             self.path_var.set(d)
             cfg = load_config(); cfg["sv_dir"] = d; save_config(cfg)
             self._log(f"Selected folder: {d}")
-            self._log("Target file: epochhead.lua")
+            self._log_target_files()
             self._last_sig = None
         elif initial and not self.sv_dir:
             self._log("No folder selected. Use 'Change…' to pick the SavedVariables folder.")
 
+    def _load_market_addon_data(self):
+        if not self._valid_dir(self.sv_dir):
+            return {}
+        targets = {
+            "aux": ["aux-addon.lua", "aux.lua", "auxhistory.lua", "aux_history.lua"],
+            "auctionator": ["auctionator.lua", "auctionatordata.lua", "auctionatorshoppinglists.lua"],
+        }
+        files_by_lower = {}
+        try:
+            for name in os.listdir(self.sv_dir):
+                files_by_lower[name.lower()] = name
+        except Exception:
+            return {}
+
+        out = {}
+        for source, names in targets.items():
+            for lname in names:
+                real = files_by_lower.get(lname)
+                if not real:
+                    continue
+                path = os.path.join(self.sv_dir, real)
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        raw = f.read()
+                    out[source] = {
+                        "file": real,
+                        "mtime": int(os.path.getmtime(path)),
+                        "size": len(raw),
+                        "raw_lua": raw,
+                    }
+                    break
+                except Exception as e:
+                    self._log(f"{source} read skipped ({real}): {e}")
+                    break
+        return out
+
     # ---------------- Watch & upload ----------------
     def _watch_loop(self):
-        """Poll epochhead.lua and push an upload when signature changes."""
+        """Poll target SavedVariables files and push an upload when signature changes."""
         while self._watcher_running:
             try:
                 if self.pause_watching:
                     time.sleep(POLL_INTERVAL_SEC)
                     continue
-                p = self._sv_file_path()
-                if p:
-                    try:
-                        st = os.stat(p)
-                        sig = (getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size)
-                        if self._last_sig is None or sig != self._last_sig:
-                            self._last_sig = sig
-                            now = time.time()
-                            if now >= self._debounce_until:
-                                self._debounce_until = now + DEBOUNCE_SEC
-                                # Auto uploads only if enabled; manual bypasses this check.
-                                if self.auto_upload:
-                                    self.queue.put(("upload", {"manual": False}))
-                    except FileNotFoundError:
-                        self._last_sig = None
+                sig = self._watched_file_signatures()
+                if self._last_sig is None:
+                    self._last_sig = sig
+                elif sig != self._last_sig:
+                    self._last_sig = sig
+                    now = time.time()
+                    if now >= self._debounce_until:
+                        self._debounce_until = now + DEBOUNCE_SEC
+                        # Auto uploads only if enabled; manual bypasses this check.
+                        if self.auto_upload:
+                            self.queue.put(("upload", {"manual": False}))
             except Exception as e:
                 logging.warning("watch loop error: %s", e)
             time.sleep(POLL_INTERVAL_SEC)
@@ -697,39 +862,44 @@ class App(tk.Tk):
         if not p:
             self._log("Select the SavedVariables folder first.")
             return
-        if not os.path.isfile(p):
-            self._log("epochhead.lua not found in the selected folder (yet).")
-            return
+        have_epochhead = os.path.isfile(p)
 
         # Rate limit successful uploads
         if self._last_success_at and (time.time() - self._last_success_at) < MIN_SUCCESS_SPACING:
             wait = MIN_SUCCESS_SPACING - (time.time() - self._last_success_at)
             time.sleep(max(0.05, wait))
 
-        # Read file
-        try:
-            with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                lua = f.read()
-        except Exception as e:
-            self._log(f"Read error: {e}")
-            self._requeue_soon()
-            return
+        events = []
+        meta = {}
+        if have_epochhead:
+            # Read file
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    lua = f.read()
+            except Exception as e:
+                self._log(f"Read error: {e}")
+                self._requeue_soon()
+                return
 
-        # Parse
-        try:
-            sv = parse_savedvars(lua, VAR_NAME)
-        except Exception as e:
-            self._log(f"Parse error (likely mid-write). Retrying soon… ({e})")
-            self._requeue_soon()
-            return
+            # Parse
+            try:
+                sv = parse_savedvars(lua, VAR_NAME)
+            except Exception as e:
+                self._log(f"Parse error (likely mid-write). Retrying soon… ({e})")
+                self._requeue_soon()
+                return
 
-        events = list(sv.get("events") or [])
-        meta   = dict(sv.get("meta")   or {})
-        if not events and not meta:
-            self._log("No events/meta found; nothing to upload.")
-            return
+            events = list(sv.get("events") or [])
+            meta = dict(sv.get("meta") or {})
+        else:
+            self._log("epochhead.lua not found; continuing with market addon exports only.")
 
         _normalize_inplace(events); _normalize_inplace(meta)
+        meta["_uploader"] = {
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "upload_tick": int(time.time()),
+        }
         if meta:
             try:
                 pmeta = meta.get("player") or {}
@@ -745,7 +915,25 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+        market_addons = self._load_market_addon_data()
+        if not events and not meta and not market_addons:
+            self._log("No uploadable data found (expected epochhead.lua, Auctionator.lua, or aux-addon.lua).")
+            return
         payload = {"events": events, "meta": meta}
+        if market_addons:
+            payload["market_addons"] = market_addons
+            self._log("Included market addon data: " + ", ".join(sorted(market_addons.keys())))
+            details = []
+            for addon_key in sorted(market_addons.keys()):
+                info = market_addons.get(addon_key) or {}
+                file_name = info.get("file") or f"{addon_key}.lua"
+                size = info.get("size")
+                if isinstance(size, int):
+                    details.append(f"{file_name} ({size} bytes)")
+                else:
+                    details.append(str(file_name))
+            if details:
+                self._log("Included file stats: " + ", ".join(details))
 
         self._log("Uploading…")
         self._uploading = True
@@ -853,6 +1041,23 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+        market_files = result.get("marketFiles") if isinstance(result, dict) else None
+        if isinstance(market_files, dict) and market_files:
+            mf_bits = []
+            for source in sorted(market_files.keys()):
+                info = market_files.get(source) or {}
+                file_name = info.get("file") or f"{source}.lua"
+                events = info.get("events")
+                err = info.get("error")
+                if err:
+                    mf_bits.append(f"{file_name}: error ({err})")
+                elif isinstance(events, int):
+                    mf_bits.append(f"{file_name}: {events} events")
+                else:
+                    mf_bits.append(str(file_name))
+            if mf_bits:
+                self._log("Market file upload stats: " + ", ".join(mf_bits))
+
         if ok and AUTO_RENAME:
             try:
                 new_name = time.strftime("epochhead_upload%Y%m%d-%H%M%S.lua", time.localtime())
@@ -861,6 +1066,7 @@ class App(tk.Tk):
                 self._log(f"Renamed uploaded file -> {new_name}")
                 self._last_sig = None
                 self._last_success_at = time.time()
+                self._cleanup_old_uploads()
             except Exception as e:
                 self._log(f"Rename failed: {e}")
         elif ok:
