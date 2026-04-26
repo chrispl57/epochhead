@@ -19,7 +19,7 @@ except Exception:
 
 # ------------------ FIXED SETTINGS ------------------
 APP_NAME           = "Epoch Uploader"
-APP_VERSION        = "1.4.0"
+APP_VERSION        = "1.5.0"
 SERVER             = "http://85.137.248.214:5001"
 TOKEN              = "devtoken"
 VAR_NAME           = "epochheadDB"
@@ -31,7 +31,7 @@ UPLOAD_ENDPOINT    = "/upload"
 LOG_MAX_LINES      = 500
 MIN_SUCCESS_SPACING= 5.0  # seconds between successful uploads
 PRIMARY_SV_FILE    = "epochhead.lua"
-TARGET_SV_FILES    = ("aux-addon.lua", "epochhead.lua", "Auctionator.lua")
+TARGET_SV_FILES    = ("aux-addon.lua", "epochhead.lua", "Auctionator.lua", "EpochCensus.lua")
 
 # Single-instance (best effort) + activation ping
 MUTEX_NAME   = r"Global\EpochUploaderMutex_v2"
@@ -827,6 +827,33 @@ class App(tk.Tk):
                     break
         return out
 
+    def _load_census_addon_data(self):
+        if not self._valid_dir(self.sv_dir):
+            return None
+        files_by_lower = {}
+        try:
+            for name in os.listdir(self.sv_dir):
+                files_by_lower[name.lower()] = name
+        except Exception:
+            return None
+
+        real = files_by_lower.get("epochcensus.lua")
+        if not real:
+            return None
+        path = os.path.join(self.sv_dir, real)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                raw = f.read()
+            return {
+                "file": real,
+                "mtime": int(os.path.getmtime(path)),
+                "size": len(raw),
+                "raw_lua": raw,
+            }
+        except Exception as e:
+            self._log(f"census read skipped ({real}): {e}")
+            return None
+
     # ---------------- Watch & upload ----------------
     def _watch_loop(self):
         """Poll target SavedVariables files and push an upload when signature changes."""
@@ -916,8 +943,9 @@ class App(tk.Tk):
                 pass
 
         market_addons = self._load_market_addon_data()
-        if not events and not meta and not market_addons:
-            self._log("No uploadable data found (expected epochhead.lua, Auctionator.lua, or aux-addon.lua).")
+        census_addon = self._load_census_addon_data()
+        if not events and not meta and not market_addons and not census_addon:
+            self._log("No uploadable data found (expected epochhead.lua, Auctionator.lua, aux-addon.lua, or EpochCensus.lua).")
             return
         payload = {"events": events, "meta": meta}
         if market_addons:
@@ -934,6 +962,14 @@ class App(tk.Tk):
                     details.append(str(file_name))
             if details:
                 self._log("Included file stats: " + ", ".join(details))
+        if census_addon:
+            payload["census_addon"] = census_addon
+            file_name = census_addon.get("file") or "EpochCensus.lua"
+            size = census_addon.get("size")
+            if isinstance(size, int):
+                self._log(f"Included census addon data: {file_name} ({size} bytes)")
+            else:
+                self._log(f"Included census addon data: {file_name}")
 
         self._log("Uploading…")
         self._uploading = True
