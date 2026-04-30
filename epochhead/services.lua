@@ -126,7 +126,8 @@ function EH.captureVendor(eventName)
     return
   end
 
-  local z, s, x, y = EH.Pos and EH.Pos() or nil
+  local z, s, x, y
+  if EH.Pos then z, s, x, y = EH.Pos() end
   local sourceKey = EH.sourceKeyForVendor and EH.sourceKeyForVendor(meta.id, meta.guid, meta.name) or nil
 
   local event = {

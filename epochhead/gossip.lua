@@ -21,10 +21,30 @@ local function buildNPCSource(kind)
   local unit = "npctarget"
   if not (UnitExists and UnitExists(unit)) then unit = "target" end
   if not (UnitExists and UnitExists(unit)) then return nil end
+  if UnitIsPlayer and UnitIsPlayer(unit) then return nil end
   local guid = UnitGUID and UnitGUID(unit) or nil
+  if guid and type(guid) == "string" then
+    local hyphenKind = guid:match("^([^-]+)%-")
+    if hyphenKind and hyphenKind ~= "Creature" and hyphenKind ~= "Vehicle" then
+      return nil
+    end
+    if not hyphenKind then
+      local up = guid:gsub("^0x", ""):upper()
+      if #up >= 4 then
+        local hi = up:sub(1, 2)
+        if hi ~= "F1" and hi ~= "F5" then
+          return nil
+        end
+      end
+    end
+  end
   local id   = guid and EH.GetEntryIdFromGUID and EH.GetEntryIdFromGUID(guid) or nil
+  if not id or id <= 0 then return nil end
   local name = UnitName and UnitName(unit) or nil
   local src = { kind = kind or "npc", id = id, guid = guid, name = name }
+  if UnitLevel then src.level = UnitLevel(unit) end
+  if UnitHealthMax then src.maxHp = UnitHealthMax(unit) end
+  if UnitManaMax then src.maxMana = UnitManaMax(unit) end
   if EH.Pos then
     local z, s, x, y = EH.Pos()
     src.zone, src.subzone, src.x, src.y = z, s, x, y

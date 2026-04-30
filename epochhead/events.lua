@@ -3,7 +3,7 @@
 local ADDON_NAME, EHns = ...
 local EH = _G.EpochHead or EHns or {}
 _G.EpochHead = EH
-EH.VERSION   = EH.VERSION or "0.9.42"
+EH.VERSION   = EH.VERSION or "0.9.43"
 
 ------------------------------------------------------------
 -- Logging helpers
@@ -640,6 +640,30 @@ local function isSkinningName(spellName)
   return s:find("skin", 1, true) ~= nil
 end
 
+local function ResolveTransformKind(spellID, spellName)
+  if EH.TRANSFORM_SPELLS then
+    if type(spellID) == "number" and EH.TRANSFORM_SPELLS[spellID] then
+      return EH.TRANSFORM_SPELLS[spellID]
+    end
+    if spellName and spellName ~= "" and GetSpellInfo then
+      for id, kind in pairs(EH.TRANSFORM_SPELLS) do
+        local knownName = GetSpellInfo(id)
+        if knownName and knownName == spellName then
+          return kind
+        end
+      end
+    end
+  end
+  if not spellName then return nil end
+  local s = tostring(spellName):lower()
+  if s:find("disenchant", 1, true) then return "disenchant" end
+  if s:find("prospect", 1, true) then return "prospect" end
+  if s:find("mill", 1, true) then return "mill" end
+  return nil
+end
+
+local BuildBagItemCountSnapshot
+
 if not EH.OnSpellcastSucceeded then
   function EH.OnSpellcastSucceeded(unit, spell, rank, lineId, spellID)
     if unit ~= "player" then return end
@@ -657,6 +681,14 @@ if not EH.OnSpellcastSucceeded then
     if (type(spellID) == "number" and spellID == 921) or (spell and spell:lower() == "pick pocket") then
       EH._lastPickpocket = { ts = now(), guid = UnitGUID("target") }
       log("pickpocket spell cast")
+      return
+    end
+
+    local transformKind = ResolveTransformKind(spellID, spell)
+    if transformKind then
+      EH._activeTransform = { ts = now(), kind = transformKind }
+      EH._transformBagSnapshot = { ts = now(), counts = BuildBagItemCountSnapshot() }
+      log(("transform spell cast: %s"):format(tostring(transformKind)))
       return
     end
 
@@ -690,6 +722,74 @@ end
 -- (tightened so non-containers don't get marked/logged)
 ------------------------------------------------------------
 EH._pendingBagOpen = EH._pendingBagOpen or nil  -- { ts, id, name, class, subClass }
+EH._activeTransform = EH._activeTransform or nil -- { ts, kind }
+EH._pendingTransformInput = EH._pendingTransformInput or nil -- { ts, kind, item={...} }
+EH._currentTransform = EH._currentTransform or nil -- { kind, item={...} }
+EH._transformBagSnapshot = EH._transformBagSnapshot or nil -- { ts, counts={ [itemId]=qty } }
+
+BuildBagItemCountSnapshot = function()
+  local counts = {}
+  if type(GetContainerNumSlots) ~= "function" then return counts end
+  for bag = 0, 4 do
+    local slots = GetContainerNumSlots(bag) or 0
+    for slot = 1, slots do
+      local id = nil
+      if _G.C_Container and C_Container.GetContainerItemID then
+        id = C_Container.GetContainerItemID(bag, slot)
+      elseif _G.GetContainerItemID then
+        id = GetContainerItemID(bag, slot)
+      end
+      if id then
+        counts[id] = (counts[id] or 0) + 1
+      end
+    end
+  end
+  return counts
+end
+
+local function GuessConsumedItemFromBagSnapshot()
+  local snap = EH._transformBagSnapshot
+  if not snap or type(snap.counts) ~= "table" then return nil end
+  if (now() - (snap.ts or 0)) > 30 then return nil end
+
+  local nowCounts = BuildBagItemCountSnapshot()
+  local candidateId, candidateDelta = nil, 0
+
+  for id, beforeQty in pairs(snap.counts) do
+    local afterQty = nowCounts[id] or 0
+    local delta = beforeQty - afterQty
+    if delta > 0 then
+      if candidateId and id ~= candidateId then
+        return nil -- ambiguous decrease
+      end
+      candidateId, candidateDelta = id, delta
+    end
+  end
+
+  if candidateId and candidateDelta > 0 then
+    return candidateId, candidateDelta
+  end
+  return nil
+end
+
+local function MarkTransformInput(kind, id, name, quality, className, subClassName, link)
+  if not kind then return end
+  EH._pendingTransformInput = {
+    ts = now(),
+    kind = tostring(kind):lower(),
+    item = {
+      id = id,
+      name = name,
+      rarity = quality,
+      class = className,
+      subclass = subClassName,
+      link = link,
+    }
+  }
+  log(("transform input: %s <- %s (id=%s rarity=%s class=%s/%s)")
+    :format(tostring(kind), tostring(name or "?"), tostring(id or "?"), tostring(quality or "?"),
+            tostring(className or "?"), tostring(subClassName or "?")))
+end
 
 local function LooksLikeContainerItem(name, className, subClassName)
   local t = tostring(name or ""):lower()
@@ -732,7 +832,10 @@ end
 local function MarkContainerUse_FromBag(bag, slot, ...)
   local link = GetContainerItemLinkSafe(bag, slot)
   local id   = ParseItemIDFromString(link) or GetContainerItemIDSafe(bag, slot)
-  local name, _, _, _, _, className, subClassName = GetItemInfo(link or id or "")
+  local name, _, quality, _, _, className, subClassName = GetItemInfo(link or id or "")
+  if EH._activeTransform and ((now() - (EH._activeTransform.ts or 0)) <= 20) then
+    MarkTransformInput(EH._activeTransform.kind, id, name, quality, className, subClassName, link)
+  end
   if LooksLikeContainerItem(name, className, subClassName) then
     EH._pendingBagOpen = { ts = now(), id = id, name = name, class = className, subClass = subClassName }
     log(("bag container candidate: %s (%s)"):format(tostring(name or "?"), tostring(id or "?")))
@@ -743,11 +846,15 @@ end
 
 local function MarkContainerUse_FromNameOrLink(item, ...)
   local id   = ParseItemIDFromString(item)
-  local name, className, subClassName = item, nil, nil
+  local name, quality, className, subClassName = item, nil, nil, nil
   if id and GetItemInfo then
-    local n, _, _, _, _, cN, scN = GetItemInfo(id)
+    local n, _, q, _, _, cN, scN = GetItemInfo(id)
     if n then name = n end
+    quality = q
     className, subClassName = cN, scN
+  end
+  if EH._activeTransform and ((now() - (EH._activeTransform.ts or 0)) <= 20) then
+    MarkTransformInput(EH._activeTransform.kind, id, name, quality, className, subClassName, item)
   end
   if LooksLikeContainerItem(name, className, subClassName) then
     EH._pendingBagOpen = { ts = now(), id = id, name = name, class = className, subClass = subClassName }
@@ -759,6 +866,35 @@ end
 
 local function MarkContainerUse_FromItemLoc(itemLoc, ...)
   -- no-op on 3.3.5; rely on LOOT_OPENED/title/loot source to confirm
+end
+
+local function ExtractBagSlotFromContainerButton(btn)
+  if type(btn) ~= "table" then return nil, nil end
+
+  -- Common 3.3.5 fields on container item buttons.
+  local bag = btn.bag or btn:GetParent() and btn:GetParent():GetID()
+  local slot = btn.slot or btn:GetID()
+
+  bag = tonumber(bag)
+  slot = tonumber(slot)
+  if not bag or not slot then return nil, nil end
+  return bag, slot
+end
+
+local function MarkTransformInput_FromContainerClick(btn, mouseButton)
+  if not EH._activeTransform then return end
+  if (now() - (EH._activeTransform.ts or 0)) > 20 then return end
+  if type(SpellIsTargeting) == "function" and not SpellIsTargeting() then return end
+
+  local bag, slot = ExtractBagSlotFromContainerButton(btn)
+  if not bag or not slot then return end
+
+  local link = GetContainerItemLinkSafe(bag, slot)
+  local id = ParseItemIDFromString(link) or GetContainerItemIDSafe(bag, slot)
+  local name, _, quality, _, _, className, subClassName = GetItemInfo(link or id or "")
+  MarkTransformInput(EH._activeTransform.kind, id, name, quality, className, subClassName, link)
+  log(("transform target click: kind=%s bag=%s slot=%s id=%s name=%s")
+    :format(tostring(EH._activeTransform.kind or "?"), tostring(bag), tostring(slot), tostring(id or "?"), tostring(name or "?")))
 end
 
 local function HookContainerUse()
@@ -773,6 +909,9 @@ local function HookContainerUse()
   end
   if type(_G.UseItemByName) == "function" then
     hooksecurefunc("UseItemByName", MarkContainerUse_FromNameOrLink)
+  end
+  if type(_G.ContainerFrameItemButton_OnClick) == "function" then
+    hooksecurefunc("ContainerFrameItemButton_OnClick", MarkTransformInput_FromContainerClick)
   end
 end
 
@@ -1050,6 +1189,25 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
   local isSkinning = RecentGatherCast("Skinning", 2.5)
   isPickpocket = isPickpocket or false
 
+  if EH._currentTransform and EH._currentTransform.kind then
+    local tr = EH._currentTransform
+    local it = tr.item or {}
+    src = {
+      kind = "transform",
+      transformKind = tr.kind,
+      itemId = it.id,
+      itemName = it.name,
+      itemRarity = it.rarity,
+      itemClass = it.class,
+      itemSubClass = it.subclass,
+    }
+    if it.id then
+      sKey = "transform:" .. tostring(tr.kind) .. ":item:" .. tostring(it.id)
+    else
+      sKey = "transform:" .. tostring(tr.kind) .. ":name:" .. slug(it.name or "unknown")
+    end
+  end
+
   -- Inventory container (bag item opened)
   if EH._currentContainer then
     src = {
@@ -1199,7 +1357,9 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
 
     -- Token de-dupe (bypass for gather and inventory-item containers)
     local _tok = BuildLootToken(src, sKey, g, lootKind, items, moneyCopper, isPickpocket)
-    local bypassToken = (src and src.kind == "gather") or (src and src.kind == "container" and src.containerKind == "item")
+    local bypassToken = (src and src.kind == "gather")
+      or (src and src.kind == "container" and src.containerKind == "item")
+      or (src and src.kind == "transform")
   if not bypassToken and lootTokenSeenRecently(_tok) then
     log("loot skipped (token cooldown) token="..tostring(_tok))
     return
@@ -1237,8 +1397,21 @@ local function PushLootEvent(items, moneyCopper, lootGUID, lootKind, lootEntry, 
   -- attempt counters
     if src and src.kind == "gather"     then ev.attempt = 1 end
     if src and src.kind == "container"  then ev.attempt = 1 end
+    if src and src.kind == "transform"  then ev.profession = tostring(src.transformKind or ""):lower(); ev.attempt = 1 end
     if isSkinning                       then ev.profession = "skinning"; ev.attempt = 1 end
     if isPickpocket                     then ev.profession = "pickpocket"; ev.attempt = 1 end
+    if src and src.kind == "transform" then
+      ev.transform = {
+        kind = src.transformKind,
+        item = {
+          id = src.itemId,
+          name = src.itemName,
+          rarity = src.itemRarity,
+          class = src.itemClass,
+          subclass = src.itemSubClass,
+        }
+      }
+    end
 
   if hasSource and lootKind == "Creature"   then markLoot(g) end
   if hasSource and lootKind == "GameObject" then markLoot(g) end
@@ -1308,6 +1481,15 @@ local function OnLootOpened()
   -- reset gather/container hints
   EH._currentGather    = nil
   EH._currentContainer = nil
+  EH._currentTransform = nil
+
+  if EH._pendingTransformInput and (now() - (EH._pendingTransformInput.ts or 0) <= 12) then
+    EH._currentTransform = {
+      kind = EH._pendingTransformInput.kind,
+      item = EH._pendingTransformInput.item,
+    }
+  end
+  EH._pendingTransformInput = nil
 
   -- title on loot frame (for chests/nodes)
   local nodeTitle = _G.LootFrameTitleText and _G.LootFrameTitleText.GetText and _G.LootFrameTitleText:GetText() or nil
@@ -1471,8 +1653,23 @@ local function OnLootOpened()
     end
   end
 
+  -- Fallback for transforms like Disenchant where selecting the bag item doesn't fire
+  -- Use the last transform spell cast when no explicit source was inferred.
+  if (not EH._currentTransform)
+     and (not EH._currentContainer)
+     and (not EH._currentGather)
+     and (not lootGUID)
+     and EH._activeTransform
+     and ((now() - (EH._activeTransform.ts or 0)) <= 10) then
+    EH._currentTransform = { kind = EH._activeTransform.kind, item = nil }
+    log(("transform fallback: %s (no item click hook)"):format(tostring(EH._activeTransform.kind or "?")))
+  end
+
   -- Finally, push the loot (pass corpseGUIDHint if we found a Creature source alongside a GameObject)
   PushLootEvent(items, (moneyCopper > 0) and moneyCopper or nil, lootGUID, lootKind, lootEntry, corpseGUIDHint, isPickpocket)
+  if EH._currentTransform and EH._currentTransform.kind then
+    EH._activeTransform = nil
+  end
   EH._lastPickpocket = nil
 end
 
@@ -1488,6 +1685,7 @@ f:RegisterEvent("PLAYER_TARGET_CHANGED")
 f:RegisterEvent("UNIT_LEVEL")
 f:RegisterEvent("LOOT_OPENED")
 f:RegisterEvent("LOOT_CLOSED")
+f:RegisterEvent("ITEM_LOCK_CHANGED")
 f:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 f:RegisterEvent("QUEST_ACCEPTED")
 f:RegisterEvent("QUEST_LOG_UPDATE")
@@ -1506,6 +1704,25 @@ local function FindQuestIDByTitle(title)
     local qTitle, _, _, _, isHeader = GetQuestLogTitle(i)
     if not isHeader and qTitle and string.lower(qTitle) == target then
       local id = GetQuestIdFromLogIndex(i); if id then return id end
+    end
+  end
+end
+local function NormalizeQuestTitle(title)
+  return tostring(title or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+EH._questTitleByID = EH._questTitleByID or {}
+EH._questIDByTitle = EH._questIDByTitle or {}
+local function RememberQuestIdentity(qid, title)
+  if qid then
+    local n = tonumber(qid)
+    if n then
+      EH._questTitleByID[n] = title or EH._questTitleByID[n]
+    end
+  end
+  if title and title ~= "" and qid then
+    local key = NormalizeQuestTitle(title)
+    if key ~= "" then
+      EH._questIDByTitle[key] = tonumber(qid) or EH._questIDByTitle[key]
     end
   end
 end
@@ -1543,7 +1760,7 @@ local function CaptureQuestLogRewards(questIndex)
   return { items = (#items > 0) and items or nil, choiceItems = (#choices > 0) and choices or nil, xp = xp, money = (money and money > 0) and { copper = money } or nil }
 end
 
-EH._pendingQuestAccept, EH._pendingQuestRewards = nil, nil
+EH._pendingQuestAccept = nil
 local function OnQuestAccepted(a1, a2)
   local questIndex, questId = nil, nil
   if type(a1) == "number" and type(a2) == "number" then questIndex, questId = a1, a2
@@ -1561,41 +1778,52 @@ local function OnQuestAccepted(a1, a2)
     rewardsPreview = CaptureQuestLogRewards(questIndex),
     zone = z, subzone = s, x = x, y = y,
   }
-  if qid then PUSH(ev); EH._pendingQuestAccept = nil else EH._pendingQuestAccept = { idx = questIndex, ev = ev, ts = now() } end
+  if qid then
+    RememberQuestIdentity(qid, title)
+    PUSH(ev); EH._pendingQuestAccept = nil
+  else
+    EH._pendingQuestAccept = { idx = questIndex, ev = ev, ts = now() }
+  end
 end
 local function OnQuestLogUpdate()
   local p = EH._pendingQuestAccept; if not p then return end
   local qid = GetQuestIdFromLogIndex(p.idx)
-  if qid then p.ev.id = qid; PUSH(p.ev); EH._pendingQuestAccept = nil end
+  if qid then
+    p.ev.id = qid
+    RememberQuestIdentity(qid, p.ev.title)
+    PUSH(p.ev)
+    EH._pendingQuestAccept = nil
+  end
 end
 local function OnQuestComplete()
-  local items, choices = {}, {}
-  local function captureList(kind, count)
-    for i = 1, (count or 0) do
-      local link = GetQuestItemLink and GetQuestItemLink(kind, i) or nil
-      local name, tex, numItems, quality = GetQuestItemInfo(kind, i)
-      local entry = EH.BuildItemEntry(link, name, numItems, quality)
-      if entry and entry.id then
-        if kind == "choice" then table.insert(choices, entry) else table.insert(items, entry) end
-      end
-    end
-  end
-  local nRewards = (GetNumQuestRewards and GetNumQuestRewards()) or 0
-  local nChoices = (GetNumQuestChoices and GetNumQuestChoices()) or 0
-  captureList("reward", nRewards); captureList("choice", nChoices)
-  EH._pendingQuestRewards = { items = items, choiceItems = choices, ts = now() }
-  log(("quest complete: rewards=%d choices=%d"):format(#items, #choices))
+  -- Reward items are captured on quest accept (rewardsPreview).
+  -- Keep completion logging lightweight and avoid duplicate reward capture at turn-in.
+  log("quest complete")
 end
 local function OnQuestTurnedIn(questID, xpReward, moneyReward)
+  local title = (GetTitleText and safecall(GetTitleText)) or nil
+  if not questID and title and title ~= "" then
+    questID = EH._questIDByTitle[NormalizeQuestTitle(title)] or FindQuestIDByTitle(title)
+  end
+  if (not title or title == "") and questID then
+    title = EH._questTitleByID[tonumber(questID) or questID]
+  end
+  RememberQuestIdentity(questID, title)
   local receiver = BuildNPCFromUnit("target")
-  local rewards = EH._pendingQuestRewards or {}
+  local z, s, x, y = EH.Pos()
+  log(("quest turned in: id=%s xp=%s money=%s receiver=%s")
+    :format(
+      tostring(questID or "?"),
+      tostring(xpReward or 0),
+      tostring(moneyReward or 0),
+      tostring(receiver and receiver.name or "?")
+    ))
   PUSH({
-    type = "quest", subtype = "turnin", t = now(), session = EH.session, id = questID, title = nil,
+    type = "quest", subtype = "turnin", t = now(), session = EH.session, id = questID, title = title,
     receiver = receiver,
     xp = xpReward, money = (moneyReward and moneyReward > 0) and { copper = moneyReward } or nil,
-    rewards = (next(rewards) and { items = rewards.items, choiceItems = rewards.choiceItems }) or nil,
+    zone = z, subzone = s, x = x, y = y,
   })
-  EH._pendingQuestRewards = nil
 end
 
 f:SetScript("OnEvent", function(self, event, ...)
@@ -1637,18 +1865,34 @@ f:SetScript("OnEvent", function(self, event, ...)
     elseif event == "LOOT_CLOSED" then
       EH._currentGather = nil
       EH._currentContainer = nil
+      EH._currentTransform = nil
       EH._pendingBagOpen = nil
+      EH._pendingTransformInput = nil
+      EH._transformBagSnapshot = nil
       EH._lastWorldOpen = nil
       EH._lastWorldObjectTooltip = nil
+    elseif event == "ITEM_LOCK_CHANGED" then
+      -- During item-targeting transforms (e.g., Disenchant), bag slot locking is one
+      -- of the most reliable signals of which source item was clicked.
+      if EH._activeTransform and ((now() - (EH._activeTransform.ts or 0)) <= 20) then
+        local bag, slot = tonumber(a1), tonumber(a2)
+        if bag and slot and type(SpellIsTargeting) == "function" and SpellIsTargeting() then
+          MarkTransformInput_FromBagSlot(bag, slot, "ITEM_LOCK_CHANGED")
+        end
+      end
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
       EH.OnSpellcastSucceeded(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10)
     elseif event == "QUEST_ACCEPTED" then
+      log("event QUEST_ACCEPTED")
       OnQuestAccepted(a1,a2)
     elseif event == "QUEST_LOG_UPDATE" then
+      log("event QUEST_LOG_UPDATE")
       OnQuestLogUpdate()
     elseif event == "QUEST_COMPLETE" then
+      log("event QUEST_COMPLETE")
       OnQuestComplete()
     elseif event == "QUEST_TURNED_IN" then
+      log("event QUEST_TURNED_IN")
       OnQuestTurnedIn(a1,a2,a3)
     elseif event == "ZONE_CHANGED_NEW_AREA" then
       -- Prevent cross-zone mis-attribution of the last-kill fallback.
