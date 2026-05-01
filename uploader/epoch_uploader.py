@@ -27,6 +27,7 @@ AUTO_RENAME        = True
 POLL_INTERVAL_SEC  = 0.75
 DEBOUNCE_SEC       = 0.75
 RETRY_ON_PARSE_SEC = 1.25
+WRITE_SETTLE_SEC   = 2.0   # wait for file to stop changing before uploading
 UPLOAD_ENDPOINT    = "/upload"
 LOG_MAX_LINES      = 500
 MIN_SUCCESS_SPACING= 5.0  # seconds between successful uploads
@@ -857,22 +858,33 @@ class App(tk.Tk):
     # ---------------- Watch & upload ----------------
     def _watch_loop(self):
         """Poll target SavedVariables files and push an upload when signature changes."""
+        pending_sig   = None
+        pending_since = 0.0
         while self._watcher_running:
             try:
                 if self.pause_watching:
                     time.sleep(POLL_INTERVAL_SEC)
+                    pending_sig = None
                     continue
                 sig = self._watched_file_signatures()
                 if self._last_sig is None:
                     self._last_sig = sig
+                    pending_sig = None
                 elif sig != self._last_sig:
-                    self._last_sig = sig
-                    now = time.time()
-                    if now >= self._debounce_until:
-                        self._debounce_until = now + DEBOUNCE_SEC
-                        # Auto uploads only if enabled; manual bypasses this check.
-                        if self.auto_upload:
-                            self.queue.put(("upload", {"manual": False}))
+                    if sig != pending_sig:
+                        # File just changed (or changed again); reset settle timer.
+                        pending_sig   = sig
+                        pending_since = time.time()
+                    elif time.time() - pending_since >= WRITE_SETTLE_SEC:
+                        # Signature stable for WRITE_SETTLE_SEC — file is done writing.
+                        self._last_sig = sig
+                        pending_sig    = None
+                        now = time.time()
+                        if now >= self._debounce_until:
+                            self._debounce_until = now + DEBOUNCE_SEC
+                            # Auto uploads only if enabled; manual bypasses this check.
+                            if self.auto_upload:
+                                self.queue.put(("upload", {"manual": False}))
             except Exception as e:
                 logging.warning("watch loop error: %s", e)
             time.sleep(POLL_INTERVAL_SEC)
@@ -1094,7 +1106,7 @@ class App(tk.Tk):
             if mf_bits:
                 self._log("Market file upload stats: " + ", ".join(mf_bits))
 
-        if ok and AUTO_RENAME:
+        if ok and AUTO_RENAME and have_epochhead:
             try:
                 new_name = time.strftime("epochhead_upload%Y%m%d-%H%M%S.lua", time.localtime())
                 new_path = os.path.join(self.sv_dir, new_name)
